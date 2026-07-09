@@ -57,4 +57,5 @@ dependencies {
     implementation("com.alphacephei:vosk-android:0.3.47")
     implementation("net.java.dev.jna:jna:5.13.0@aar")
     implementation("com.google.mlkit:translate:17.0.2")
+    implementation("com.google.mlkit:language-id:17.0.6")
 }

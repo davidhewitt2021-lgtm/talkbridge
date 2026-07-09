@@ -27,6 +27,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
@@ -50,7 +51,17 @@ class MainActivity : AppCompatActivity() {
         // --- Tuning knobs ---
         const val MIN_CONF = 0.70         // whole-utterance confidence floor
         const val SINGLE_WORD_CONF = 0.90 // single words must be near-certain
-        const val MERGE_GAP_MS = 1100L    // silence needed to end a sentence
+        const val MERGE_GAP_MS = 1000L    // silence needed to end a sentence
+
+        // --- Tier 1 intelligence ---
+        const val SPEECH_THRESHOLD_MULT = 2.5f // voice = level above noiseFloor * this
+        const val SPEECH_THRESHOLD_MIN = 0.045f // absolute minimum voice level
+        const val SPEECH_HANGOVER_MS = 700L    // keep decoding this long after voice stops
+        const val NOISE_FLOOR_ALPHA = 0.05f    // background noise adaptation speed
+        const val LOCK_MIN_WORDS = 4           // words needed before locking language
+        const val LOCK_MARGIN = 0.12           // confidence gap needed to lock
+        const val STICKY_BONUS = 0.08          // score bonus for last speaker's language
+
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -71,6 +82,13 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var hasPendingUtterance = false
     private var shownFlag = "" // avoid redundant UI churn
+
+    // Tier 1 state
+    private val languageId by lazy { LanguageIdentification.getClient() }
+    private var lastCommittedLang = "" // sticky prior: people rarely alternate every sentence
+
+    @Volatile
+    private var lockedLang: String? = null // set once one decoder is clearly winning
 
     private var modelEn: Model? = null
     private var modelPt: Model? = null
@@ -304,6 +322,11 @@ class MainActivity : AppCompatActivity() {
         val buffer = ShortArray(CHUNK)
         var wasSpeaking = false
 
+        // VAD state: adaptive background-noise estimate + speech hangover
+        var noiseFloor = 0.02f
+        var inSpeech = false
+        var lastVoicedMs = 0L
+
         try {
             recorder.startRecording()
             while (running.get()) {
@@ -327,36 +350,74 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (wasSpeaking) {
                     recEn.reset(); recPt.reset()
+                    lockedLang = null
+                    inSpeech = false
                     wasSpeaking = false
                 }
                 meter.push(level)
 
-                val enDone = recEn.acceptWaveForm(buffer, n)
-                val ptDone = recPt.acceptWaveForm(buffer, n)
+                // ---- VAD: is anyone actually talking? ----
+                val threshold = maxOf(noiseFloor * SPEECH_THRESHOLD_MULT, SPEECH_THRESHOLD_MIN)
+                val voiced = level > threshold
+                val now = SystemClock.elapsedRealtime()
+                if (voiced) {
+                    lastVoicedMs = now
+                    lastVoiceActivityMs = now
+                    inSpeech = true
+                } else {
+                    // Adapt the noise estimate only from non-voice audio
+                    noiseFloor += NOISE_FLOOR_ALPHA * (level - noiseFloor)
+                }
+                val active = inSpeech && (voiced || now - lastVoicedMs <= SPEECH_HANGOVER_MS)
+
+                if (inSpeech && !active) {
+                    // Utterance ended (VAD): force-finalize whatever the decoders hold
+                    inSpeech = false
+                    val enHyp = parseHyp(recEn.finalResult)
+                    val ptHyp = parseHyp(recPt.finalResult)
+                    recEn.reset(); recPt.reset()
+                    lockedLang = null
+                    if (enHyp.words > 0 || ptHyp.words > 0) {
+                        runOnUiThread { bufferSegment(enHyp, ptHyp) }
+                    } else {
+                        runOnUiThread { partialText.text = "" }
+                    }
+                    continue
+                }
+
+                if (!active) {
+                    // Silence: the decoders never see it — no hallucinations
+                    // from background noise, and near-zero CPU while quiet
+                    if (!hasPendingUtterance) showFlag("\uD83C\uDF99", colorIdle) // 🎙
+                    continue
+                }
+
+                // ---- Active speech: feed the decoders ----
+                // Once one language is clearly winning, stop paying for the loser
+                val lock = lockedLang
+                val enDone = if (lock != "pt") recEn.acceptWaveForm(buffer, n) else false
+                val ptDone = if (lock != "en") recPt.acceptWaveForm(buffer, n) else false
 
                 if (enDone || ptDone) {
-                    val enHyp = parseHyp(if (enDone) recEn.result else recEn.finalResult)
-                    val ptHyp = parseHyp(if (ptDone) recPt.result else recPt.finalResult)
+                    val enHyp = parseHyp(if (lock != "pt") { if (enDone) recEn.result else recEn.finalResult } else null)
+                    val ptHyp = parseHyp(if (lock != "en") { if (ptDone) recPt.result else recPt.finalResult } else null)
                     recEn.reset(); recPt.reset()
                     if (enHyp.words > 0 || ptHyp.words > 0) {
                         lastVoiceActivityMs = SystemClock.elapsedRealtime()
                         runOnUiThread { bufferSegment(enHyp, ptHyp) }
                     }
                 } else {
-                    val pEn = JSONObject(recEn.partialResult).optString("partial")
-                    val pPt = JSONObject(recPt.partialResult).optString("partial")
+                    val pEn = if (lock != "pt") JSONObject(recEn.partialResult).optString("partial") else ""
+                    val pPt = if (lock != "en") JSONObject(recPt.partialResult).optString("partial") else ""
                     val partial = if (pPt.length > pEn.length) pPt else pEn
                     if (partial.isNotEmpty()) {
-                        // Voice activity: don't let the commit timer fire mid-word
                         lastVoiceActivityMs = SystemClock.elapsedRealtime()
                         // Provisional language lead: longer decode usually fits better
-                        if (pPt.length > pEn.length + 2) {
+                        if (lock == "pt" || pPt.length > pEn.length + 2) {
                             showFlag("\uD83C\uDDF5\uD83C\uDDF9", colorPt) // 🇵🇹
-                        } else if (pEn.length > pPt.length + 2) {
+                        } else if (lock == "en" || pEn.length > pPt.length + 2) {
                             showFlag("\uD83C\uDDEC\uD83C\uDDE7", colorEn) // 🇬🇧
                         }
-                    } else if (!hasPendingUtterance) {
-                        showFlag("\uD83C\uDF99", colorIdle) // 🎙 idle
                     }
                     runOnUiThread { partialText.text = partial }
                 }
@@ -413,6 +474,16 @@ class MainActivity : AppCompatActivity() {
         if (ptAvg > enAvg) showFlag("\uD83C\uDDF5\uD83C\uDDF9", colorPt)
         else if (enAvg > 0.0) showFlag("\uD83C\uDDEC\uD83C\uDDE7", colorEn)
 
+        // Lock-in: if one decoder is clearly winning with enough evidence,
+        // stop feeding the loser for the rest of this utterance (saves ~half
+        // the CPU and reduces cross-language confusion mid-sentence)
+        if (lockedLang == null &&
+            maxOf(enWordCount, ptWordCount) >= LOCK_MIN_WORDS &&
+            kotlin.math.abs(enAvg - ptAvg) >= LOCK_MARGIN
+        ) {
+            lockedLang = if (ptAvg > enAvg) "pt" else "en"
+        }
+
         mainHandler.removeCallbacks(commitRunnable)
         mainHandler.postDelayed(commitRunnable, MERGE_GAP_MS)
     }
@@ -425,7 +496,15 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { flagView.text = flag }
     }
 
-    /** Decide language over the full utterance, gate noise, translate. */
+    /**
+     * Decide language over the full utterance using four signals:
+     *   1. Vosk decoder confidence (weight 1.5)
+     *   2. ML Kit language ID — does the decode actually read as its own
+     *      language? Garbled cross-language decodes score lower (weight 0.5)
+     *   3. Word-count share — the right decoder transcribes more (weight 0.5)
+     *   4. Sticky prior — small bonus for whoever spoke last
+     * Then gate noise and translate.
+     */
     private fun commitPending() {
         val enAvg = if (enWordCount > 0) enConfSum / enWordCount else 0.0
         val ptAvg = if (ptWordCount > 0) ptConfSum / ptWordCount else 0.0
@@ -438,18 +517,45 @@ class MainActivity : AppCompatActivity() {
         enConfSum = 0.0; enWordCount = 0
         ptConfSum = 0.0; ptWordCount = 0
         hasPendingUtterance = false
+        lockedLang = null
 
         if (enWords == 0 && ptWords == 0) return
 
-        val (lang, text, avg, words) =
-            if (ptAvg > enAvg) Committed("pt", ptText, ptAvg, ptWords)
-            else Committed("en", enText, enAvg, enWords)
+        val totalWords = (enWords + ptWords).coerceAtLeast(1)
+        val enShare = enWords.toDouble() / totalWords
+        val ptShare = ptWords.toDouble() / totalWords
 
-        // Noise gate — applied once, to the whole utterance
-        if (words == 0 || avg < MIN_CONF) return
-        if (words == 1 && avg < SINGLE_WORD_CONF) return
+        // Ask ML Kit whether each decode reads as its own language
+        langConfidence(enText, "en") { enLid ->
+            langConfidence(ptText, "pt") { ptLid ->
+                var scoreEn = 1.5 * enAvg + 0.5 * enLid + 0.5 * enShare
+                var scorePt = 1.5 * ptAvg + 0.5 * ptLid + 0.5 * ptShare
+                if (lastCommittedLang == "en") scoreEn += STICKY_BONUS
+                if (lastCommittedLang == "pt") scorePt += STICKY_BONUS
 
-        translateAndSpeak(text, lang)
+                val (lang, text, avg, words) =
+                    if (scorePt > scoreEn) Committed("pt", ptText, ptAvg, ptWords)
+                    else Committed("en", enText, enAvg, enWords)
+
+                // Noise gate — applied once, to the whole utterance
+                if (words == 0 || avg < MIN_CONF) return@langConfidence
+                if (words == 1 && avg < SINGLE_WORD_CONF) return@langConfidence
+
+                lastCommittedLang = lang
+                translateAndSpeak(text, lang)
+            }
+        }
+    }
+
+    /** Confidence (0..1) that [text] is in language [tag], via on-device ML Kit. */
+    private fun langConfidence(text: String, tag: String, then: (Double) -> Unit) {
+        if (text.isBlank()) { then(0.0); return }
+        languageId.identifyPossibleLanguages(text)
+            .addOnSuccessListener { candidates ->
+                val match = candidates.firstOrNull { it.languageTag.startsWith(tag) }
+                then(match?.confidence?.toDouble() ?: 0.0)
+            }
+            .addOnFailureListener { then(0.5) } // neutral if the identifier fails
     }
 
     private data class Committed(
@@ -562,6 +668,7 @@ class MainActivity : AppCompatActivity() {
         tts?.shutdown()
         enToPt.close()
         ptToEn.close()
+        languageId.close()
         modelEn?.close()
         modelPt?.close()
     }
