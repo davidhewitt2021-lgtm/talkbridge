@@ -118,6 +118,11 @@ class MainActivity : AppCompatActivity() {
     private var audioThread: Thread? = null
 
     private var lastCommittedLang = "en" // fallback for ambiguous detections
+
+    // Last utterance kept for the tap-flag-to-flip correction
+    private var lastSamples: FloatArray? = null
+    private var lastDurationS = 0f
+    private var lastEntryView: TextView? = null
     private var lastLangFlag = "\uD83C\uDF99" // last language flag, restored after TTS
     private var lastLangColor = 0xFF888888.toInt()
 
@@ -148,6 +153,7 @@ class MainActivity : AppCompatActivity() {
         btnConversation.isEnabled = false
         btnConversation.setOnClickListener { toggleConversation() }
         btnUpdate.setOnClickListener { checkForUpdate() }
+        flagView.setOnClickListener { redoLastAsOtherLanguage() }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -402,6 +408,8 @@ class MainActivity : AppCompatActivity() {
     private fun decodeSegment(samples: FloatArray) {
         try {
             val durationS = samples.size.toFloat() / SAMPLE_RATE
+            lastSamples = samples
+            lastDurationS = durationS
 
             if (durationS >= MIN_TRANSLATE_S) {
                 // Audio-level translation (always English out) + forced-EN transcript
@@ -413,7 +421,11 @@ class MainActivity : AppCompatActivity() {
                 when {
                     enText == null && translated == null -> return
                     enText != null && translated != null &&
-                        wordSimilarity(enText, translated) >= EN_SIMILARITY -> {
+                        maxOf(
+                            wordSimilarity(enText, translated),
+                            wordContainment(enText, translated),
+                            wordContainment(translated, enText)
+                        ) >= EN_SIMILARITY -> {
                         // Transcript matches the translation: the audio WAS English
                         commitEnglish(enText)
                     }
@@ -530,6 +542,54 @@ class MainActivity : AppCompatActivity() {
                     speak(fallback, "en")
                 }
             }
+    }
+
+    /** Fraction of a's words found in b (paraphrase/length tolerant), 0..1. */
+    private fun wordContainment(a: String, b: String): Double {
+        fun tokens(t: String) = t.lowercase()
+            .replace(Regex("[^a-z0-9à-ÿ ]"), " ")
+            .split(Regex("\\s+")).filter { it.isNotBlank() }
+        val ta = tokens(a)
+        if (ta.isEmpty()) return 0.0
+        val tb = tokens(b).toSet()
+        return ta.count { it in tb }.toDouble() / ta.size
+    }
+
+    /**
+     * Tap-the-flag correction: re-run the last utterance forced to the OTHER
+     * language, replacing the transcript entry and the spoken output. This is
+     * the guaranteed escape hatch for auto-detection's irreducible error tail.
+     */
+    private fun redoLastAsOtherLanguage() {
+        val samples = lastSamples ?: return
+        val durationS = lastDurationS
+        val flipTo = if (lastCommittedLang == "en") "pt" else "en"
+        tts?.stop()
+        ttsSpeaking.set(false)
+        lastEntryView?.let { entry -> runOnUiThread { transcript.removeView(entry) } }
+        lastEntryView = null
+        decodesInFlight.incrementAndGet()
+        runOnUiThread { partialText.text = getString(R.string.status_transcribing) }
+        decodeExecutor.execute {
+            try {
+                if (flipTo == "pt") {
+                    val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                        ?: return@execute
+                    commitLang("pt")
+                    commitPortuguese(samples, ptText, durationS)
+                } else {
+                    val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
+                        ?: return@execute
+                    commitEnglish(enText)
+                }
+            } catch (e: Exception) {
+                runOnUiThread { toast(getString(R.string.mic_failed, e.message)) }
+            } finally {
+                if (decodesInFlight.decrementAndGet() == 0) {
+                    runOnUiThread { partialText.text = "" }
+                }
+            }
+        }
     }
 
     /** Word-set overlap (Jaccard) between two texts, 0..1. */
@@ -689,6 +749,7 @@ class MainActivity : AppCompatActivity() {
         entry.setTypeface(Typeface.DEFAULT)
         entry.gravity = if (sourceLang == "en") Gravity.START else Gravity.END
         transcript.addView(entry)
+        lastEntryView = entry
         transcriptScroll.post { transcriptScroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
