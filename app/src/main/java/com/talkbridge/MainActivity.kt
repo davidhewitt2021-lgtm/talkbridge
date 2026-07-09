@@ -72,6 +72,7 @@ class MainActivity : AppCompatActivity() {
         const val MAX_SPEECH_S = 18f          // hard cap per utterance
         const val WHISPER_THREADS = 4
         const val MAX_WORD_RUN = 2            // collapse word repeats beyond this
+        const val EN_ACCEPT_RATIO = 1.3       // how clearly English must win arbitration
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -111,6 +112,8 @@ class MainActivity : AppCompatActivity() {
     private var audioThread: Thread? = null
 
     private var lastCommittedLang = "en" // fallback for ambiguous detections
+    private var lastLangFlag = "\uD83C\uDF99" // last language flag, restored after TTS
+    private var lastLangColor = 0xFF888888.toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -348,6 +351,7 @@ class MainActivity : AppCompatActivity() {
                     vad.flush()
                     while (!vad.empty()) vad.pop() // discard anything captured pre-TTS
                     wasSpeaking = false
+                    showFlag(lastLangFlag, lastLangColor) // restore language flag
                 }
                 meter.push(level)
 
@@ -356,9 +360,9 @@ class MainActivity : AppCompatActivity() {
 
                 if (vad.isSpeechDetected()) {
                     showFlag("\uD83D\uDC42", colorIdle) // 👂 hearing speech
-                } else if (decodesInFlight.get() == 0) {
-                    showFlag("\uD83C\uDF99", colorIdle) // 🎙 idle
                 }
+                // NOTE: no idle repaint — the last language flag persists
+                // between utterances so people can actually see it
 
                 // Completed speech segments -> Whisper (off this thread)
                 while (!vad.empty()) {
@@ -384,38 +388,60 @@ class MainActivity : AppCompatActivity() {
     /** Runs on the decode executor: identify language, then forced decode. */
     private fun decodeSegment(samples: FloatArray) {
         try {
-            // Stage 1: fast language ID (Whisper tiny, ~0.2-0.5s)
+            val durationS = samples.size.toFloat() / SAMPLE_RATE
+
+            // Stage 1: fast language ID (Whisper tiny)
             val lid = slid ?: return
             val lidStream = lid.createStream()
             lidStream.acceptWaveform(samples, SAMPLE_RATE)
             val detected = lid.compute(lidStream).lowercase().filter { it.isLetter() }
             lidStream.release()
 
-            val lang = when (detected) {
-                "en" -> "en"
-                // pt-PT is occasionally tagged as Galician or Spanish;
-                // in a two-language app, fold those into Portuguese
-                "pt", "gl", "es" -> "pt"
-                "" -> lastCommittedLang // ID failed: assume same speaker
-                else -> return // confidently another language: not for us
+            // Stage 2: asymmetric trust. LID has a known English bias and
+            // pt-PT is a frequent victim, so:
+            //  - any non-English tag  -> the Portuguese speaker
+            //  - an "en" tag          -> suspicious: decode BOTH ways and
+            //                            let the transcripts arbitrate
+            val lang: String
+            val text: String
+            when {
+                detected == "en" -> {
+                    val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
+                    val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                    when {
+                        enText == null && ptText == null -> return
+                        ptText == null -> { lang = "en"; text = enText!! }
+                        enText == null -> { lang = "pt"; text = ptText }
+                        else -> {
+                            // A wrong-language forced decode comes out shorter
+                            // and messier; English must clearly win to be chosen
+                            val enW = enText.split(" ").size
+                            val ptW = ptText.split(" ").size
+                            val bar = if (lastCommittedLang == "en") 1.0 else EN_ACCEPT_RATIO
+                            if (enW >= ptW * bar) { lang = "en"; text = enText }
+                            else { lang = "pt"; text = ptText }
+                        }
+                    }
+                }
+                detected.isBlank() -> {
+                    lang = lastCommittedLang
+                    text = sanitizeTranscript(
+                        decodeWith(if (lang == "en") recognizerEn else recognizerPt, samples),
+                        durationS
+                    ) ?: return
+                }
+                else -> {
+                    lang = "pt"
+                    text = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                        ?: return
+                }
             }
 
-            // Stage 2: decode with the language FORCED — no detection wobble,
-            // and forced decodes are more accurate than auto ones
-            val rec = (if (lang == "en") recognizerEn else recognizerPt) ?: return
-            val stream = rec.createStream()
-            stream.acceptWaveform(samples, SAMPLE_RATE)
-            rec.decode(stream)
-            val result = rec.getResult(stream)
-            stream.release()
-
-            val durationS = samples.size.toFloat() / SAMPLE_RATE
-            val text = sanitizeTranscript(result.text, durationS) ?: return
-
             lastCommittedLang = lang
+            if (lang == "pt") { lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt }
+            else { lastLangFlag = "\uD83C\uDDEC\uD83C\uDDE7"; lastLangColor = colorEn }
             runOnUiThread {
-                if (lang == "pt") showFlag("\uD83C\uDDF5\uD83C\uDDF9", colorPt)
-                else showFlag("\uD83C\uDDEC\uD83C\uDDE7", colorEn)
+                showFlag(lastLangFlag, lastLangColor)
             }
             translateAndSpeak(text, lang)
         } catch (e: Exception) {
@@ -425,6 +451,17 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { partialText.text = "" }
             }
         }
+    }
+
+    /** One forced decode of a segment; returns the raw transcript. */
+    private fun decodeWith(rec: OfflineRecognizer?, samples: FloatArray): String {
+        val r = rec ?: return ""
+        val stream = r.createStream()
+        stream.acceptWaveform(samples, SAMPLE_RATE)
+        r.decode(stream)
+        val text = r.getResult(stream).text
+        stream.release()
+        return text
     }
 
     /**
