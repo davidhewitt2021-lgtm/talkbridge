@@ -392,86 +392,75 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Runs on the decode executor: identify language, then forced decode. */
+    /**
+     * Runs on the decode executor. The language decision is made by the
+     * transcript-vs-translation similarity test in BOTH directions (spoken
+     * language ID proved biased both ways). The tiny LID model is only
+     * consulted for short clips where the translate task is unreliable.
+     */
     private fun decodeSegment(samples: FloatArray) {
         try {
             val durationS = samples.size.toFloat() / SAMPLE_RATE
 
-            // Stage 1: fast language ID (Whisper tiny)
+            if (durationS >= MIN_TRANSLATE_S) {
+                // Audio-level translation (always English out) + forced-EN transcript
+                val translated = sanitizeTranscript(
+                    decodeWith(recognizerPtTranslate, samples), durationS
+                )
+                val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
+
+                when {
+                    enText == null && translated == null -> return
+                    enText != null && translated != null &&
+                        wordSimilarity(enText, translated) >= EN_SIMILARITY -> {
+                        // Transcript matches the translation: the audio WAS English
+                        commitEnglish(enText)
+                    }
+                    enText != null && translated == null -> {
+                        // Translation failed but a clean English transcript exists
+                        commitEnglish(enText)
+                    }
+                    else -> {
+                        // Divergent (or no EN transcript): the audio was Portuguese
+                        val ptText = sanitizeTranscript(
+                            decodeWith(recognizerPt, samples), durationS
+                        ) ?: return
+                        commitLang("pt")
+                        commitPortuguese(samples, ptText, durationS, translated)
+                    }
+                }
+                return
+            }
+
+            // ---- Short clip: translate task unreliable, ask the LID model ----
             val lid = slid ?: return
             val lidStream = lid.createStream()
             lidStream.acceptWaveform(samples, SAMPLE_RATE)
             val detected = lid.compute(lidStream).lowercase().filter { it.isLetter() }
             lidStream.release()
 
-            // Stage 2: asymmetric trust. LID has a known English bias and
-            // pt-PT is a frequent victim, so:
-            //  - any non-English tag  -> the Portuguese speaker
-            //  - an "en" tag          -> suspicious: decode BOTH ways and
-            //                            let the transcripts arbitrate
-            val lang: String
-            val text: String
-            when {
-                detected == "en" -> {
-                    val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
-                    if (enText != null && durationS >= MIN_TRANSLATE_S) {
-                        // Decisive test: on ENGLISH audio, the forced-EN
-                        // transcript and the audio-level translation are near
-                        // identical; on PORTUGUESE audio they diverge (garbled
-                        // transcript vs coherent translation). Length-based
-                        // arbitration broke once whisper-small started fluently
-                        // TRANSLATING wrong-language audio instead of garbling.
-                        val translated = sanitizeTranscript(
-                            decodeWith(recognizerPtTranslate, samples), durationS
-                        )
-                        if (translated != null && wordSimilarity(enText, translated) >= EN_SIMILARITY) {
-                            lang = "en"; text = enText
+            if (detected == "en") {
+                val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
+                val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                when {
+                    enText == null && ptText == null -> return
+                    ptText == null -> commitEnglish(enText!!)
+                    enText == null -> { commitLang("pt"); translateAndSpeak(ptText, "pt") }
+                    else -> {
+                        val bar = if (lastCommittedLang == "en") 1.0 else EN_ACCEPT_RATIO
+                        if (enText.split(" ").size >= ptText.split(" ").size * bar) {
+                            commitEnglish(enText)
                         } else {
-                            val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                                ?: return
-                            lastCommittedLang = "pt"
-                            lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt
-                            showFlag(lastLangFlag, lastLangColor)
-                            commitPortuguese(samples, ptText, durationS, translated)
-                            return
+                            commitLang("pt"); translateAndSpeak(ptText, "pt")
                         }
-                    } else if (enText != null) {
-                        // Too short for the similarity test: length heuristic
-                        val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                        if (ptText == null) { lang = "en"; text = enText }
-                        else {
-                            val bar = if (lastCommittedLang == "en") 1.0 else EN_ACCEPT_RATIO
-                            if (enText.split(" ").size >= ptText.split(" ").size * bar) {
-                                lang = "en"; text = enText
-                            } else { lang = "pt"; text = ptText }
-                        }
-                    } else {
-                        lang = "pt"
-                        text = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                            ?: return
                     }
                 }
-                detected.isBlank() -> {
-                    lang = lastCommittedLang
-                    text = sanitizeTranscript(
-                        decodeWith(if (lang == "en") recognizerEn else recognizerPt, samples),
-                        durationS
-                    ) ?: return
-                }
-                else -> {
-                    lang = "pt"
-                    text = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                        ?: return
-                }
+            } else {
+                val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                    ?: return
+                commitLang("pt")
+                translateAndSpeak(ptText, "pt") // short PT -> ML Kit
             }
-
-            lastCommittedLang = lang
-            if (lang == "pt") { lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt }
-            else { lastLangFlag = "\uD83C\uDDEC\uD83C\uDDE7"; lastLangColor = colorEn }
-            showFlag(lastLangFlag, lastLangColor)
-
-            if (lang == "pt") commitPortuguese(samples, text, durationS)
-            else translateAndSpeak(text, "en")
         } catch (e: Exception) {
             runOnUiThread { toast(getString(R.string.mic_failed, e.message)) }
         } finally {
@@ -479,6 +468,18 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { partialText.text = "" }
             }
         }
+    }
+
+    private fun commitLang(lang: String) {
+        lastCommittedLang = lang
+        if (lang == "pt") { lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt }
+        else { lastLangFlag = "\uD83C\uDDEC\uD83C\uDDE7"; lastLangColor = colorEn }
+        showFlag(lastLangFlag, lastLangColor)
+    }
+
+    private fun commitEnglish(text: String) {
+        commitLang("en")
+        translateAndSpeak(text, "en")
     }
 
     /** One forced decode of a segment; returns the raw transcript. */
@@ -542,7 +543,9 @@ class MainActivity : AppCompatActivity() {
     private fun sanitizeTranscript(raw: String, durationS: Float): String? {
         fun norm(w: String) = w.lowercase().trim('.', ',', '!', '?', ';', ':', '…', '-')
 
-        val words = raw.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        // Strip whisper event tags emitted on music/noise: [Música], (music), ♪
+        val cleaned = raw.replace(Regex("\\[[^\\]]*\\]|\\([^)]*\\)|♪"), " ")
+        val words = cleaned.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return null
 
         // 1. Collapse word runs: "no no no no no" -> "no no"
