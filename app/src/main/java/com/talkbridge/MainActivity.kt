@@ -83,17 +83,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnConversation: Button
     private lateinit var btnUpdate: Button
     private lateinit var flagView: TextView
+    private lateinit var activityView: TextView
     private lateinit var meter: LevelMeterView
 
     private val colorEn = 0xFF1E5AA8.toInt() // blue
     private val colorPt = 0xFFDA291C.toInt() // red
     private val colorIdle = 0xFF888888.toInt()
     private var shownFlag = ""
+    private var shownActivity = ""
 
     // Two language-forced decoders (forced decode beats auto-detect decode)
     // plus a fast dedicated language-identification pass (Whisper tiny)
     private var recognizerEn: OfflineRecognizer? = null
     private var recognizerPt: OfflineRecognizer? = null
+    private var recognizerPtTranslate: OfflineRecognizer? = null // whisper translate task: PT audio -> EN text
     private var slid: SpokenLanguageIdentification? = null
     private var vad: Vad? = null
     private val decodeExecutor = Executors.newSingleThreadExecutor()
@@ -136,6 +139,7 @@ class MainActivity : AppCompatActivity() {
         btnConversation = findViewById(R.id.btnConversation)
         btnUpdate = findViewById(R.id.btnUpdate)
         flagView = findViewById(R.id.flagView)
+        activityView = findViewById(R.id.activityView)
         meter = findViewById(R.id.meter)
 
         btnConversation.isEnabled = false
@@ -214,7 +218,7 @@ class MainActivity : AppCompatActivity() {
         setStatus(getString(R.string.status_loading_speech))
         Thread {
             try {
-                fun makeRecognizer(language: String) = OfflineRecognizer(
+                fun makeRecognizer(language: String, whisperTask: String) = OfflineRecognizer(
                     assets,
                     OfflineRecognizerConfig(
                         featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
@@ -223,7 +227,7 @@ class MainActivity : AppCompatActivity() {
                                 encoder = "whisper/base-encoder.int8.onnx",
                                 decoder = "whisper/base-decoder.int8.onnx",
                                 language = language, // forced: no in-decode detection
-                                task = "transcribe",
+                                task = whisperTask,
                             ),
                             tokens = "whisper/base-tokens.txt",
                             numThreads = WHISPER_THREADS,
@@ -231,8 +235,9 @@ class MainActivity : AppCompatActivity() {
                         ),
                     )
                 )
-                recognizerEn = makeRecognizer("en")
-                recognizerPt = makeRecognizer("pt")
+                recognizerEn = makeRecognizer("en", "transcribe")
+                recognizerPt = makeRecognizer("pt", "transcribe")
+                recognizerPtTranslate = makeRecognizer("pt", "translate")
 
                 // Dedicated language ID: a fast Whisper-tiny pass per segment
                 slid = SpokenLanguageIdentification(
@@ -301,7 +306,7 @@ class MainActivity : AppCompatActivity() {
         audioThread = null
         partialText.text = ""
         meter.clear()
-        showFlag("\uD83C\uDF99", colorIdle) // 🎙
+        showActivity("\uD83C\uDF99") // 🎙
         btnConversation.text = getString(R.string.btn_start_conversation)
         setStatus(getString(R.string.status_ready))
     }
@@ -351,7 +356,7 @@ class MainActivity : AppCompatActivity() {
                     vad.flush()
                     while (!vad.empty()) vad.pop() // discard anything captured pre-TTS
                     wasSpeaking = false
-                    showFlag(lastLangFlag, lastLangColor) // restore language flag
+                    showActivity("\uD83C\uDF99") // 🎙
                 }
                 meter.push(level)
 
@@ -440,10 +445,10 @@ class MainActivity : AppCompatActivity() {
             lastCommittedLang = lang
             if (lang == "pt") { lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt }
             else { lastLangFlag = "\uD83C\uDDEC\uD83C\uDDE7"; lastLangColor = colorEn }
-            runOnUiThread {
-                showFlag(lastLangFlag, lastLangColor)
-            }
-            translateAndSpeak(text, lang)
+            showFlag(lastLangFlag, lastLangColor)
+
+            if (lang == "pt") commitPortuguese(samples, text, durationS)
+            else translateAndSpeak(text, "en")
         } catch (e: Exception) {
             runOnUiThread { toast(getString(R.string.mic_failed, e.message)) }
         } finally {
@@ -462,6 +467,22 @@ class MainActivity : AppCompatActivity() {
         val text = r.getResult(stream).text
         stream.release()
         return text
+    }
+
+    /**
+     * PT -> EN goes through Whisper's native translate task: English is
+     * produced directly from the AUDIO (better than ML Kit, and immune to
+     * transcription-error compounding). Falls back to ML Kit if the
+     * translate decode comes back empty.
+     */
+    private fun commitPortuguese(samples: FloatArray, ptTranscript: String, durationS: Float) {
+        val english = sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
+        if (english != null) {
+            runOnUiThread { addTranscriptEntry("pt", ptTranscript, english) }
+            speak(english, "en")
+        } else {
+            translateAndSpeak(ptTranscript, "pt")
+        }
     }
 
     /**
@@ -615,6 +636,13 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { flagView.text = flag }
     }
 
+    /** The activity icon (mic/ear/speaker) — separate from the language flag. */
+    private fun showActivity(icon: String) {
+        if (icon == shownActivity) return
+        shownActivity = icon
+        runOnUiThread { activityView.text = icon }
+    }
+
     private fun setStatus(msg: String) = runOnUiThread { statusText.text = msg }
 
     private fun toast(msg: String) = runOnUiThread {
@@ -632,6 +660,7 @@ class MainActivity : AppCompatActivity() {
         if (::ptToEn.isInitialized) ptToEn.close()
         recognizerEn?.release()
         recognizerPt?.release()
+        recognizerPtTranslate?.release()
         slid?.release()
         vad?.release()
     }
