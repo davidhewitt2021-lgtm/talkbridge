@@ -34,6 +34,9 @@ import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
+import com.k2fsa.sherpa.onnx.SpokenLanguageIdentification
+import com.k2fsa.sherpa.onnx.SpokenLanguageIdentificationConfig
+import com.k2fsa.sherpa.onnx.SpokenLanguageIdentificationWhisperConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
 import org.json.JSONObject
@@ -86,7 +89,11 @@ class MainActivity : AppCompatActivity() {
     private val colorIdle = 0xFF888888.toInt()
     private var shownFlag = ""
 
-    private var recognizer: OfflineRecognizer? = null
+    // Two language-forced decoders (forced decode beats auto-detect decode)
+    // plus a fast dedicated language-identification pass (Whisper tiny)
+    private var recognizerEn: OfflineRecognizer? = null
+    private var recognizerPt: OfflineRecognizer? = null
+    private var slid: SpokenLanguageIdentification? = null
     private var vad: Vad? = null
     private val decodeExecutor = Executors.newSingleThreadExecutor()
     private val decodesInFlight = AtomicInteger(0)
@@ -199,26 +206,42 @@ class MainActivity : AppCompatActivity() {
             .addOnFailureListener { setStatus(getString(R.string.status_translation_failed)) }
     }
 
-    /** Load Whisper + Silero VAD straight from APK assets (no copy step). */
+    /** Load Whisper + SLID + Silero VAD straight from APK assets. */
     private fun initSpeechEngine() {
         setStatus(getString(R.string.status_loading_speech))
         Thread {
             try {
-                val recConfig = OfflineRecognizerConfig(
-                    featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
-                    modelConfig = OfflineModelConfig(
-                        whisper = OfflineWhisperModelConfig(
-                            encoder = "whisper/base-encoder.int8.onnx",
-                            decoder = "whisper/base-decoder.int8.onnx",
-                            language = "", // empty = Whisper auto-detects the language
-                            task = "transcribe",
+                fun makeRecognizer(language: String) = OfflineRecognizer(
+                    assets,
+                    OfflineRecognizerConfig(
+                        featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
+                        modelConfig = OfflineModelConfig(
+                            whisper = OfflineWhisperModelConfig(
+                                encoder = "whisper/base-encoder.int8.onnx",
+                                decoder = "whisper/base-decoder.int8.onnx",
+                                language = language, // forced: no in-decode detection
+                                task = "transcribe",
+                            ),
+                            tokens = "whisper/base-tokens.txt",
+                            numThreads = WHISPER_THREADS,
+                            modelType = "whisper",
                         ),
-                        tokens = "whisper/base-tokens.txt",
-                        numThreads = WHISPER_THREADS,
-                        modelType = "whisper",
-                    ),
+                    )
                 )
-                recognizer = OfflineRecognizer(assets, recConfig)
+                recognizerEn = makeRecognizer("en")
+                recognizerPt = makeRecognizer("pt")
+
+                // Dedicated language ID: a fast Whisper-tiny pass per segment
+                slid = SpokenLanguageIdentification(
+                    assets,
+                    SpokenLanguageIdentificationConfig(
+                        whisper = SpokenLanguageIdentificationWhisperConfig(
+                            encoder = "lid/tiny-encoder.int8.onnx",
+                            decoder = "lid/tiny-decoder.int8.onnx",
+                        ),
+                        numThreads = 2,
+                    )
+                )
 
                 val vadConfig = VadModelConfig(
                     sileroVadModelConfig = SileroVadModelConfig(
@@ -358,10 +381,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Runs on the decode executor: Whisper transcribe + language detect. */
+    /** Runs on the decode executor: identify language, then forced decode. */
     private fun decodeSegment(samples: FloatArray) {
         try {
-            val rec = recognizer ?: return
+            // Stage 1: fast language ID (Whisper tiny, ~0.2-0.5s)
+            val lid = slid ?: return
+            val lidStream = lid.createStream()
+            lidStream.acceptWaveform(samples, SAMPLE_RATE)
+            val detected = lid.compute(lidStream).lowercase().filter { it.isLetter() }
+            lidStream.release()
+
+            val lang = when (detected) {
+                "en" -> "en"
+                // pt-PT is occasionally tagged as Galician or Spanish;
+                // in a two-language app, fold those into Portuguese
+                "pt", "gl", "es" -> "pt"
+                "" -> lastCommittedLang // ID failed: assume same speaker
+                else -> return // confidently another language: not for us
+            }
+
+            // Stage 2: decode with the language FORCED — no detection wobble,
+            // and forced decodes are more accurate than auto ones
+            val rec = (if (lang == "en") recognizerEn else recognizerPt) ?: return
             val stream = rec.createStream()
             stream.acceptWaveform(samples, SAMPLE_RATE)
             rec.decode(stream)
@@ -370,17 +411,6 @@ class MainActivity : AppCompatActivity() {
 
             val durationS = samples.size.toFloat() / SAMPLE_RATE
             val text = sanitizeTranscript(result.text, durationS) ?: return
-
-            // Whisper's detected language, e.g. "<|en|>" or "en"
-            val rawLang = result.lang.lowercase().filter { it.isLetter() }
-            val lang = when (rawLang) {
-                "en" -> "en"
-                // pt-PT is occasionally tagged as Galician or Spanish by Whisper;
-                // in a two-language app, fold those into Portuguese
-                "pt", "gl", "es" -> "pt"
-                "" -> lastCommittedLang // detection failed: assume same speaker
-                else -> return // confidently some other language: not for us
-            }
 
             lastCommittedLang = lang
             runOnUiThread {
@@ -563,7 +593,9 @@ class MainActivity : AppCompatActivity() {
         tts?.shutdown()
         if (::enToPt.isInitialized) enToPt.close()
         if (::ptToEn.isInitialized) ptToEn.close()
-        recognizer?.release()
+        recognizerEn?.release()
+        recognizerPt?.release()
+        slid?.release()
         vad?.release()
     }
 }
