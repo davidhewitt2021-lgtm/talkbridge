@@ -75,6 +75,7 @@ class MainActivity : AppCompatActivity() {
         const val EN_ACCEPT_RATIO = 1.3       // how clearly English must win arbitration
         const val MIN_TRANSLATE_S = 2.0f      // clips shorter than this use ML Kit instead of whisper-translate
         const val EN_SIMILARITY = 0.5         // transcript-vs-translation overlap that proves English audio
+        const val TRANSLATE_AGREE = 0.6       // whisper/ML Kit agreement needed to prefer whisper's wording
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -499,25 +500,36 @@ class MainActivity : AppCompatActivity() {
      * transcription-error compounding). Falls back to ML Kit if the
      * translate decode comes back empty.
      */
+    /**
+     * PT -> EN translation ensemble. ML Kit is faithful to the transcript;
+     * whisper-translate is more fluent but prone to phonetic passthrough
+     * ("cerveja" -> "survey"). Whisper's wording is used only when the two
+     * independent translations agree; on divergence, faithfulness wins.
+     */
     private fun commitPortuguese(
         samples: FloatArray, ptTranscript: String, durationS: Float,
         precomputedEnglish: String? = null
     ) {
-        // Whisper's translate task is unreliable on very short clips with no
-        // context ("Bom dia" -> "Bon dia"); short phrases go via ML Kit on the
-        // transcription instead, which handles them well
-        if (durationS < MIN_TRANSLATE_S) {
-            translateAndSpeak(ptTranscript, "pt")
-            return
-        }
-        val english = precomputedEnglish
-            ?: sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
-        if (english != null) {
-            runOnUiThread { addTranscriptEntry("pt", ptTranscript, english) }
-            speak(english, "en")
-        } else {
-            translateAndSpeak(ptTranscript, "pt")
-        }
+        val whisperEnglish = precomputedEnglish
+            ?: if (durationS >= MIN_TRANSLATE_S)
+                sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
+            else null
+
+        ptToEn.translate(ptTranscript)
+            .addOnSuccessListener { mlkit ->
+                val chosen = if (whisperEnglish != null &&
+                    wordSimilarity(whisperEnglish, mlkit) >= TRANSLATE_AGREE
+                ) whisperEnglish else mlkit
+                addTranscriptEntry("pt", ptTranscript, chosen)
+                speak(chosen, "en")
+            }
+            .addOnFailureListener {
+                val fallback = whisperEnglish
+                if (fallback != null) {
+                    runOnUiThread { addTranscriptEntry("pt", ptTranscript, fallback) }
+                    speak(fallback, "en")
+                }
+            }
     }
 
     /** Word-set overlap (Jaccard) between two texts, 0..1. */
@@ -543,10 +555,14 @@ class MainActivity : AppCompatActivity() {
     private fun sanitizeTranscript(raw: String, durationS: Float): String? {
         fun norm(w: String) = w.lowercase().trim('.', ',', '!', '?', ';', ':', '…', '-')
 
-        // Strip whisper event tags emitted on music/noise: [Música], (music), ♪
-        val cleaned = raw.replace(Regex("\\[[^\\]]*\\]|\\([^)]*\\)|♪"), " ")
+        // Strip whisper event tags emitted on music/noise, including
+        // unclosed ones: [Música], (music), "(laughs", ♪
+        val cleaned = raw.replace(Regex("\\[[^\\]]*\\]?|\\([^)]*\\)?|♪"), " ")
         val words = cleaned.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return null
+        val junk = setOf("laughs", "laughter", "music", "applause", "sighs",
+                         "risos", "música", "musica", "aplausos")
+        if (words.all { it.lowercase().trim('.', ',', '!') in junk }) return null
 
         // 1. Collapse word runs: "no no no no no" -> "no no"
         val collapsed = ArrayList<String>(words.size)
