@@ -14,15 +14,24 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Download offline speech models (Vosk)
+      - name: Download sherpa-onnx Android library
         run: |
-          mkdir -p app/src/main/assets
-          curl -sL -o en.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
-          curl -sL -o pt.zip https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip
-          unzip -q en.zip
-          unzip -q pt.zip
-          mv vosk-model-small-en-us-0.15 app/src/main/assets/model-en
-          mv vosk-model-small-pt-0.3 app/src/main/assets/model-pt
+          mkdir -p app/libs
+          curl -sL -o app/libs/sherpa-onnx.aar \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.14/sherpa-onnx-1.12.14.aar
+
+      - name: Download Whisper model (base, int8) and Silero VAD
+        run: |
+          mkdir -p app/src/main/assets/whisper app/src/main/assets/vad
+          curl -sL -o whisper.tar.bz2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2
+          tar xf whisper.tar.bz2
+          cp sherpa-onnx-whisper-base/base-encoder.int8.onnx app/src/main/assets/whisper/
+          cp sherpa-onnx-whisper-base/base-decoder.int8.onnx app/src/main/assets/whisper/
+          cp sherpa-onnx-whisper-base/base-tokens.txt        app/src/main/assets/whisper/
+          curl -sL -o app/src/main/assets/vad/silero_vad.onnx \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+          ls -lh app/src/main/assets/whisper app/src/main/assets/vad
 
       - name: Restore signing key
         run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > $HOME/talkbridge.keystore
@@ -43,6 +52,12 @@ jobs:
           KEYSTORE_PATH: /home/runner/talkbridge.keystore
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: gradle assembleRelease
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TalkBridge-apk
+          path: app/build/outputs/apk/release/app-release.apk
 
       - name: Publish release (for in-app updates)
         if: github.ref == 'refs/heads/main'

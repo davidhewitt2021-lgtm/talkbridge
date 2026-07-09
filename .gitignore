@@ -5,3 +5,4 @@ local.properties
 *.apk
 app/src/main/assets/model-en/
 app/src/main/assets/model-pt/
+app/libs/

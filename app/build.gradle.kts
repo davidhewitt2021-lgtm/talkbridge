@@ -15,7 +15,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = ciBuildNumber
-        versionName = "2.$ciBuildNumber"
+        versionName = "3.$ciBuildNumber"
     }
 
     buildFeatures {
@@ -54,8 +54,11 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
-    implementation("com.alphacephei:vosk-android:0.3.47")
-    implementation("net.java.dev.jna:jna:5.13.0@aar")
+
+    // Whisper + Silero VAD on-device via sherpa-onnx
+    // (the AAR is downloaded into app/libs/ by the CI workflow)
+    implementation(files("libs/sherpa-onnx.aar"))
+
+    // Offline translation (models download once, then work offline forever)
     implementation("com.google.mlkit:translate:17.0.2")
-    implementation("com.google.mlkit:language-id:17.0.6")
 }
