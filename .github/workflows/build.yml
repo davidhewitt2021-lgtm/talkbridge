@@ -24,11 +24,11 @@ jobs:
         run: |
           mkdir -p app/src/main/assets/whisper app/src/main/assets/lid app/src/main/assets/vad
           curl -sL -o whisper.tar.bz2 \
-            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2
           tar xf whisper.tar.bz2
-          cp sherpa-onnx-whisper-base/base-encoder.int8.onnx app/src/main/assets/whisper/
-          cp sherpa-onnx-whisper-base/base-decoder.int8.onnx app/src/main/assets/whisper/
-          cp sherpa-onnx-whisper-base/base-tokens.txt        app/src/main/assets/whisper/
+          cp sherpa-onnx-whisper-small/small-encoder.int8.onnx app/src/main/assets/whisper/
+          cp sherpa-onnx-whisper-small/small-decoder.int8.onnx app/src/main/assets/whisper/
+          cp sherpa-onnx-whisper-small/small-tokens.txt        app/src/main/assets/whisper/
           curl -sL -o tiny.tar.bz2 \
             https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2
           tar xf tiny.tar.bz2

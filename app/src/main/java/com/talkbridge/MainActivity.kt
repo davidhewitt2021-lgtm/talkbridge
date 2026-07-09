@@ -50,7 +50,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * TalkBridge v3 engine: OpenAI Whisper (base, int8) running on-device via
+ * TalkBridge v3 engine: OpenAI Whisper (small, int8) running on-device via
  * sherpa-onnx, segmented by the Silero neural voice-activity detector.
  *
  * Compared to the old dual-Vosk design:
@@ -73,6 +73,7 @@ class MainActivity : AppCompatActivity() {
         const val WHISPER_THREADS = 4
         const val MAX_WORD_RUN = 2            // collapse word repeats beyond this
         const val EN_ACCEPT_RATIO = 1.3       // how clearly English must win arbitration
+        const val MIN_TRANSLATE_S = 2.0f      // clips shorter than this use ML Kit instead of whisper-translate
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -224,12 +225,12 @@ class MainActivity : AppCompatActivity() {
                         featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
                         modelConfig = OfflineModelConfig(
                             whisper = OfflineWhisperModelConfig(
-                                encoder = "whisper/base-encoder.int8.onnx",
-                                decoder = "whisper/base-decoder.int8.onnx",
+                                encoder = "whisper/small-encoder.int8.onnx",
+                                decoder = "whisper/small-decoder.int8.onnx",
                                 language = language, // forced: no in-decode detection
                                 task = whisperTask,
                             ),
-                            tokens = "whisper/base-tokens.txt",
+                            tokens = "whisper/small-tokens.txt",
                             numThreads = WHISPER_THREADS,
                             modelType = "whisper",
                         ),
@@ -476,6 +477,13 @@ class MainActivity : AppCompatActivity() {
      * translate decode comes back empty.
      */
     private fun commitPortuguese(samples: FloatArray, ptTranscript: String, durationS: Float) {
+        // Whisper's translate task is unreliable on very short clips with no
+        // context ("Bom dia" -> "Bon dia"); short phrases go via ML Kit on the
+        // transcription instead, which handles them well
+        if (durationS < MIN_TRANSLATE_S) {
+            translateAndSpeak(ptTranscript, "pt")
+            return
+        }
         val english = sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
         if (english != null) {
             runOnUiThread { addTranscriptEntry("pt", ptTranscript, english) }
