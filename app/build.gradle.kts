@@ -3,8 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// CI builds get an auto-incrementing version from the GitHub Actions run number
 val ciBuildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+val keystorePath: String? = System.getenv("KEYSTORE_PATH")
 
 android {
     namespace = "com.talkbridge"
@@ -22,9 +22,23 @@ android {
         buildConfig = true
     }
 
+    signingConfigs {
+        if (keystorePath != null) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = "talkbridge"
+                keyPassword = System.getenv("KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePath != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {
@@ -40,11 +54,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
-
-    // Offline speech recognition
     implementation("com.alphacephei:vosk-android:0.3.47")
     implementation("net.java.dev.jna:jna:5.13.0@aar")
-
-    // Offline translation (models download once, then work offline forever)
     implementation("com.google.mlkit:translate:17.0.2")
 }
