@@ -43,14 +43,29 @@
             android:orientation="vertical" />
     </ScrollView>
 
-    <!-- Live hearing panel: detected-language flag + voice level meter -->
-    <TextView
-        android:id="@+id/flagView"
+    <!-- Live panel: activity icon (mic/ear/speaker) + detected language flag,
+         shown side by side so the flag is always visible -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:gravity="center"
-        android:textSize="72sp"
-        android:text="🎙" />
+        android:orientation="horizontal"
+        android:gravity="center">
+
+        <TextView
+            android:id="@+id/activityView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="56sp"
+            android:text="🎙" />
+
+        <TextView
+            android:id="@+id/flagView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="32dp"
+            android:textSize="56sp"
+            android:text="" />
+    </LinearLayout>
 
     <com.talkbridge.LevelMeterView
         android:id="@+id/meter"
