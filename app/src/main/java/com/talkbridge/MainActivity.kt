@@ -11,6 +11,7 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
@@ -45,9 +46,9 @@ class MainActivity : AppCompatActivity() {
         const val CHUNK = 1600 // 0.1s of audio
 
         // --- Tuning knobs ---
-        const val MIN_CONF = 0.72        // discard utterances below this avg confidence
+        const val MIN_CONF = 0.70         // whole-utterance confidence floor
         const val SINGLE_WORD_CONF = 0.90 // single words must be near-certain
-        const val MERGE_GAP_MS = 900L     // pause length that ends a sentence
+        const val MERGE_GAP_MS = 1100L    // silence needed to end a sentence
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -68,16 +69,36 @@ class MainActivity : AppCompatActivity() {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
-    private val running = AtomicBoolean(false)      // conversation mode on/off
-    private val ttsSpeaking = AtomicBoolean(false)  // echo suppression flag
+    private val running = AtomicBoolean(false)
+    private val ttsSpeaking = AtomicBoolean(false)
     private var audioThread: Thread? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Sentence merging state
-    private var pendingText = ""
-    private var pendingLang = ""
-    private val commitRunnable = Runnable { commitPending() }
+    // ---- Utterance accumulation (UI thread only) ----
+    // Both decodes of the same audio are buffered in full; language is decided
+    // once, over the whole utterance, at commit time.
+    private val enBuf = StringBuilder()
+    private val ptBuf = StringBuilder()
+    private var enConfSum = 0.0
+    private var enWordCount = 0
+    private var ptConfSum = 0.0
+    private var ptWordCount = 0
+
+    @Volatile
+    private var lastVoiceActivityMs = 0L
+
+    private val commitRunnable = object : Runnable {
+        override fun run() {
+            val idle = SystemClock.elapsedRealtime() - lastVoiceActivityMs
+            if (idle < MERGE_GAP_MS) {
+                // Still talking — check again once the gap could be complete
+                mainHandler.postDelayed(this, MERGE_GAP_MS - idle)
+            } else {
+                commitPending()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -203,7 +224,6 @@ class MainActivity : AppCompatActivity() {
         running.set(true)
         btnConversation.text = getString(R.string.btn_stop_conversation)
         setStatus(getString(R.string.status_conversing))
-
         audioThread = Thread { audioLoop() }.also { it.start() }
     }
 
@@ -240,13 +260,12 @@ class MainActivity : AppCompatActivity() {
                 val n = recorder.read(buffer, 0, buffer.size)
                 if (n <= 0) continue
 
-                // Echo suppression: while the phone is talking, discard mic input
+                // Echo suppression: ignore the mic while the phone is talking
                 if (ttsSpeaking.get()) {
                     wasSpeaking = true
                     continue
                 }
                 if (wasSpeaking) {
-                    // Flush anything the recognizers were mid-way through
                     recEn.reset(); recPt.reset()
                     wasSpeaking = false
                 }
@@ -258,12 +277,18 @@ class MainActivity : AppCompatActivity() {
                     val enHyp = parseHyp(if (enDone) recEn.result else recEn.finalResult)
                     val ptHyp = parseHyp(if (ptDone) recPt.result else recPt.finalResult)
                     recEn.reset(); recPt.reset()
-                    handleSegment(enHyp, ptHyp)
+                    if (enHyp.words > 0 || ptHyp.words > 0) {
+                        lastVoiceActivityMs = SystemClock.elapsedRealtime()
+                        runOnUiThread { bufferSegment(enHyp, ptHyp) }
+                    }
                 } else {
-                    // Live partial: show whichever language has more to say
                     val pEn = JSONObject(recEn.partialResult).optString("partial")
                     val pPt = JSONObject(recPt.partialResult).optString("partial")
                     val partial = if (pPt.length > pEn.length) pPt else pEn
+                    if (partial.isNotEmpty()) {
+                        // Voice activity: don't let the commit timer fire mid-word
+                        lastVoiceActivityMs = SystemClock.elapsedRealtime()
+                    }
                     runOnUiThread { partialText.text = partial }
                 }
             }
@@ -290,38 +315,59 @@ class MainActivity : AppCompatActivity() {
         return Hyp(text, sum / arr.length(), arr.length())
     }
 
-    /** Decide language for a finished segment, gate out noise, merge into pending sentence. */
-    private fun handleSegment(en: Hyp, pt: Hyp) {
-        if (en.words == 0 && pt.words == 0) return
-
-        val (lang, hyp) = if (pt.avgConf > en.avgConf) "pt" to pt else "en" to en
-
-        // Noise gate
-        if (hyp.avgConf < MIN_CONF) return
-        if (hyp.words == 1 && hyp.avgConf < SINGLE_WORD_CONF) return
-
-        runOnUiThread {
-            mainHandler.removeCallbacks(commitRunnable)
-            if (pendingLang.isNotEmpty() && pendingLang != lang) {
-                // Speaker switched language: finish the previous sentence first
-                commitPending()
-            }
-            pendingLang = lang
-            pendingText = if (pendingText.isEmpty()) hyp.text else "$pendingText ${hyp.text}"
-            partialText.text = ""
-            // Wait for a real pause before translating, in case the sentence continues
-            mainHandler.postDelayed(commitRunnable, MERGE_GAP_MS)
+    /**
+     * Buffer BOTH decodes of this audio segment. Nothing is discarded here —
+     * the noise gate and language decision happen once, over the whole
+     * utterance, in commitPending(). (Gating per-segment was the v2 bug that
+     * dropped the middle of sentences.)
+     */
+    private fun bufferSegment(en: Hyp, pt: Hyp) {
+        if (en.text.isNotBlank()) {
+            if (enBuf.isNotEmpty()) enBuf.append(' ')
+            enBuf.append(en.text)
+            enConfSum += en.avgConf * en.words
+            enWordCount += en.words
         }
+        if (pt.text.isNotBlank()) {
+            if (ptBuf.isNotEmpty()) ptBuf.append(' ')
+            ptBuf.append(pt.text)
+            ptConfSum += pt.avgConf * pt.words
+            ptWordCount += pt.words
+        }
+        partialText.text = ""
+        mainHandler.removeCallbacks(commitRunnable)
+        mainHandler.postDelayed(commitRunnable, MERGE_GAP_MS)
     }
 
+    /** Decide language over the full utterance, gate noise, translate. */
     private fun commitPending() {
-        val text = pendingText
-        val lang = pendingLang
-        pendingText = ""
-        pendingLang = ""
-        if (text.isBlank()) return
+        val enAvg = if (enWordCount > 0) enConfSum / enWordCount else 0.0
+        val ptAvg = if (ptWordCount > 0) ptConfSum / ptWordCount else 0.0
+        val enText = enBuf.toString()
+        val ptText = ptBuf.toString()
+        val enWords = enWordCount
+        val ptWords = ptWordCount
+
+        enBuf.clear(); ptBuf.clear()
+        enConfSum = 0.0; enWordCount = 0
+        ptConfSum = 0.0; ptWordCount = 0
+
+        if (enWords == 0 && ptWords == 0) return
+
+        val (lang, text, avg, words) =
+            if (ptAvg > enAvg) Committed("pt", ptText, ptAvg, ptWords)
+            else Committed("en", enText, enAvg, enWords)
+
+        // Noise gate — applied once, to the whole utterance
+        if (words == 0 || avg < MIN_CONF) return
+        if (words == 1 && avg < SINGLE_WORD_CONF) return
+
         translateAndSpeak(text, lang)
     }
+
+    private data class Committed(
+        val lang: String, val text: String, val avg: Double, val words: Int
+    )
 
     // ---------- Translate + speak ----------
 
@@ -341,7 +387,7 @@ class MainActivity : AppCompatActivity() {
         val locale = if (lang == "pt") Locale("pt", "PT") else Locale.UK
         t.language = if (t.isLanguageAvailable(locale) >= TextToSpeech.LANG_AVAILABLE) locale
         else if (lang == "pt") Locale("pt") else Locale.ENGLISH
-        ttsSpeaking.set(true) // set eagerly; listener keeps it accurate
+        ttsSpeaking.set(true)
         t.speak(text, TextToSpeech.QUEUE_ADD, null, "utt-${System.currentTimeMillis()}")
     }
 
