@@ -2,6 +2,8 @@ package com.talkbridge
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
@@ -58,6 +60,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var transcriptScroll: ScrollView
     private lateinit var btnConversation: Button
     private lateinit var btnUpdate: Button
+    private lateinit var flagView: TextView
+    private lateinit var meter: LevelMeterView
+
+    // Colours for the meter per language
+    private val colorEn = 0xFF1E5AA8.toInt() // blue
+    private val colorPt = 0xFFDA291C.toInt() // red
+    private val colorIdle = 0xFF888888.toInt()
+
+    @Volatile
+    private var hasPendingUtterance = false
+    private var shownFlag = "" // avoid redundant UI churn
 
     private var modelEn: Model? = null
     private var modelPt: Model? = null
@@ -102,6 +115,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // If the last run crashed, show the report instead of the normal UI
+        // (and skip all initialisation so we can't crash the same way again)
+        val crashFile = File(filesDir, "last_crash.txt")
+        if (crashFile.exists()) {
+            val trace = crashFile.readText()
+            crashFile.delete()
+            showCrashReport(trace)
+            return
+        }
+
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
@@ -110,6 +134,8 @@ class MainActivity : AppCompatActivity() {
         transcriptScroll = findViewById(R.id.transcriptScroll)
         btnConversation = findViewById(R.id.btnConversation)
         btnUpdate = findViewById(R.id.btnUpdate)
+        flagView = findViewById(R.id.flagView)
+        meter = findViewById(R.id.meter)
 
         btnConversation.isEnabled = false
         btnConversation.setOnClickListener { toggleConversation() }
@@ -124,6 +150,28 @@ class MainActivity : AppCompatActivity() {
         initTts()
         initTranslators()
         initVoskModels()
+    }
+
+    // ---------- Crash reporting ----------
+
+    /** Fullscreen selectable stack trace, auto-copied to the clipboard. */
+    private fun showCrashReport(trace: String) {
+        val tv = TextView(this).apply {
+            text = trace
+            textSize = 12f
+            setTextIsSelectable(true)
+            typeface = Typeface.MONOSPACE
+            setPadding(32, 32, 32, 32)
+        }
+        val scroll = ScrollView(this).apply { addView(tv) }
+        setContentView(scroll)
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("TalkBridge crash", trace))
+        Toast.makeText(
+            this,
+            "Crash report copied to clipboard — paste it into the chat",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     // ---------- Initialisation ----------
@@ -234,6 +282,8 @@ class MainActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(commitRunnable)
         commitPending()
         partialText.text = ""
+        meter.clear()
+        showFlag("\uD83C\uDF99", colorIdle) // 🎙
         btnConversation.text = getString(R.string.btn_start_conversation)
         setStatus(getString(R.string.status_ready))
     }
@@ -260,15 +310,26 @@ class MainActivity : AppCompatActivity() {
                 val n = recorder.read(buffer, 0, buffer.size)
                 if (n <= 0) continue
 
+                // Voice level for the meter (RMS of this 0.1s chunk)
+                var sum = 0.0
+                for (i in 0 until n) {
+                    val s = buffer[i].toDouble()
+                    sum += s * s
+                }
+                val level = (Math.sqrt(sum / n) / 32768.0 * 12.0).toFloat()
+
                 // Echo suppression: ignore the mic while the phone is talking
                 if (ttsSpeaking.get()) {
                     wasSpeaking = true
+                    meter.push(0f)
+                    showFlag("\uD83D\uDD0A", colorIdle) // 🔊
                     continue
                 }
                 if (wasSpeaking) {
                     recEn.reset(); recPt.reset()
                     wasSpeaking = false
                 }
+                meter.push(level)
 
                 val enDone = recEn.acceptWaveForm(buffer, n)
                 val ptDone = recPt.acceptWaveForm(buffer, n)
@@ -288,6 +349,14 @@ class MainActivity : AppCompatActivity() {
                     if (partial.isNotEmpty()) {
                         // Voice activity: don't let the commit timer fire mid-word
                         lastVoiceActivityMs = SystemClock.elapsedRealtime()
+                        // Provisional language lead: longer decode usually fits better
+                        if (pPt.length > pEn.length + 2) {
+                            showFlag("\uD83C\uDDF5\uD83C\uDDF9", colorPt) // 🇵🇹
+                        } else if (pEn.length > pPt.length + 2) {
+                            showFlag("\uD83C\uDDEC\uD83C\uDDE7", colorEn) // 🇬🇧
+                        }
+                    } else if (!hasPendingUtterance) {
+                        showFlag("\uD83C\uDF99", colorIdle) // 🎙 idle
                     }
                     runOnUiThread { partialText.text = partial }
                 }
@@ -335,8 +404,25 @@ class MainActivity : AppCompatActivity() {
             ptWordCount += pt.words
         }
         partialText.text = ""
+        hasPendingUtterance = true
+
+        // Provisional flag from the running confidence totals — more reliable
+        // than partial length once whole segments are in
+        val enAvg = if (enWordCount > 0) enConfSum / enWordCount else 0.0
+        val ptAvg = if (ptWordCount > 0) ptConfSum / ptWordCount else 0.0
+        if (ptAvg > enAvg) showFlag("\uD83C\uDDF5\uD83C\uDDF9", colorPt)
+        else if (enAvg > 0.0) showFlag("\uD83C\uDDEC\uD83C\uDDE7", colorEn)
+
         mainHandler.removeCallbacks(commitRunnable)
         mainHandler.postDelayed(commitRunnable, MERGE_GAP_MS)
+    }
+
+    /** Update flag emoji + meter colour, skipping redundant UI posts. */
+    private fun showFlag(flag: String, accent: Int) {
+        if (flag == shownFlag) return
+        shownFlag = flag
+        meter.setAccent(accent)
+        runOnUiThread { flagView.text = flag }
     }
 
     /** Decide language over the full utterance, gate noise, translate. */
@@ -351,6 +437,7 @@ class MainActivity : AppCompatActivity() {
         enBuf.clear(); ptBuf.clear()
         enConfSum = 0.0; enWordCount = 0
         ptConfSum = 0.0; ptWordCount = 0
+        hasPendingUtterance = false
 
         if (enWords == 0 && ptWords == 0) return
 
