@@ -74,6 +74,7 @@ class MainActivity : AppCompatActivity() {
         const val MAX_WORD_RUN = 2            // collapse word repeats beyond this
         const val EN_ACCEPT_RATIO = 1.3       // how clearly English must win arbitration
         const val MIN_TRANSLATE_S = 2.0f      // clips shorter than this use ML Kit instead of whisper-translate
+        const val EN_SIMILARITY = 0.5         // transcript-vs-translation overlap that proves English audio
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -413,20 +414,41 @@ class MainActivity : AppCompatActivity() {
             when {
                 detected == "en" -> {
                     val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
-                    val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                    when {
-                        enText == null && ptText == null -> return
-                        ptText == null -> { lang = "en"; text = enText!! }
-                        enText == null -> { lang = "pt"; text = ptText }
-                        else -> {
-                            // A wrong-language forced decode comes out shorter
-                            // and messier; English must clearly win to be chosen
-                            val enW = enText.split(" ").size
-                            val ptW = ptText.split(" ").size
-                            val bar = if (lastCommittedLang == "en") 1.0 else EN_ACCEPT_RATIO
-                            if (enW >= ptW * bar) { lang = "en"; text = enText }
-                            else { lang = "pt"; text = ptText }
+                    if (enText != null && durationS >= MIN_TRANSLATE_S) {
+                        // Decisive test: on ENGLISH audio, the forced-EN
+                        // transcript and the audio-level translation are near
+                        // identical; on PORTUGUESE audio they diverge (garbled
+                        // transcript vs coherent translation). Length-based
+                        // arbitration broke once whisper-small started fluently
+                        // TRANSLATING wrong-language audio instead of garbling.
+                        val translated = sanitizeTranscript(
+                            decodeWith(recognizerPtTranslate, samples), durationS
+                        )
+                        if (translated != null && wordSimilarity(enText, translated) >= EN_SIMILARITY) {
+                            lang = "en"; text = enText
+                        } else {
+                            val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                                ?: return
+                            lastCommittedLang = "pt"
+                            lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt
+                            showFlag(lastLangFlag, lastLangColor)
+                            commitPortuguese(samples, ptText, durationS, translated)
+                            return
                         }
+                    } else if (enText != null) {
+                        // Too short for the similarity test: length heuristic
+                        val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                        if (ptText == null) { lang = "en"; text = enText }
+                        else {
+                            val bar = if (lastCommittedLang == "en") 1.0 else EN_ACCEPT_RATIO
+                            if (enText.split(" ").size >= ptText.split(" ").size * bar) {
+                                lang = "en"; text = enText
+                            } else { lang = "pt"; text = ptText }
+                        }
+                    } else {
+                        lang = "pt"
+                        text = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                            ?: return
                     }
                 }
                 detected.isBlank() -> {
@@ -476,7 +498,10 @@ class MainActivity : AppCompatActivity() {
      * transcription-error compounding). Falls back to ML Kit if the
      * translate decode comes back empty.
      */
-    private fun commitPortuguese(samples: FloatArray, ptTranscript: String, durationS: Float) {
+    private fun commitPortuguese(
+        samples: FloatArray, ptTranscript: String, durationS: Float,
+        precomputedEnglish: String? = null
+    ) {
         // Whisper's translate task is unreliable on very short clips with no
         // context ("Bom dia" -> "Bon dia"); short phrases go via ML Kit on the
         // transcription instead, which handles them well
@@ -484,13 +509,24 @@ class MainActivity : AppCompatActivity() {
             translateAndSpeak(ptTranscript, "pt")
             return
         }
-        val english = sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
+        val english = precomputedEnglish
+            ?: sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
         if (english != null) {
             runOnUiThread { addTranscriptEntry("pt", ptTranscript, english) }
             speak(english, "en")
         } else {
             translateAndSpeak(ptTranscript, "pt")
         }
+    }
+
+    /** Word-set overlap (Jaccard) between two texts, 0..1. */
+    private fun wordSimilarity(a: String, b: String): Double {
+        fun tokens(t: String) = t.lowercase()
+            .replace(Regex("[^a-z0-9à-ÿ ]"), " ")
+            .split(Regex("\\s+")).filter { it.isNotBlank() }.toSet()
+        val ta = tokens(a); val tb = tokens(b)
+        if (ta.isEmpty() || tb.isEmpty()) return 0.0
+        return ta.intersect(tb).size.toDouble() / ta.union(tb).size
     }
 
     /**
