@@ -3,6 +3,9 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// CI builds get an auto-incrementing version from the GitHub Actions run number
+val ciBuildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+
 android {
     namespace = "com.talkbridge"
     compileSdk = 34
@@ -11,8 +14,12 @@ android {
         applicationId = "com.talkbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = ciBuildNumber
+        versionName = "2.$ciBuildNumber"
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {

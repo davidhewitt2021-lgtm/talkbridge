@@ -1,18 +1,22 @@
 <resources>
     <string name="app_name">TalkBridge</string>
 
-    <string name="btn_english">🇬🇧 I speak\nEnglish</string>
-    <string name="btn_portuguese">🇵🇹 Eu falo\nPortuguês</string>
-    <string name="btn_stop">■ Stop / Parar</string>
+    <string name="btn_start_conversation">🎙 Start conversation / Iniciar conversa</string>
+    <string name="btn_stop_conversation">■ Stop / Parar</string>
+    <string name="btn_update">Update</string>
 
     <string name="status_starting">Starting… / A iniciar…</string>
     <string name="status_downloading_translation">Downloading translation packs (first run only)…</string>
     <string name="status_translation_failed">Translation pack download failed — connect to the internet once and restart the app.</string>
     <string name="status_loading_speech">Loading speech models… / A carregar…</string>
     <string name="status_speech_failed">Speech model failed to load: %1$s</string>
-    <string name="status_ready">Ready — tap a button and speak / Pronto — toque num botão e fale</string>
-    <string name="status_listening_en">Listening (English)… tap Stop when done</string>
-    <string name="status_listening_pt">A ouvir (Português)… toque em Parar quando terminar</string>
+    <string name="status_ready">Ready — just talk, in either language / Pronto — fale, em qualquer língua</string>
+    <string name="status_conversing">Listening… speak naturally / A ouvir… fale naturalmente</string>
+
+    <string name="status_checking_update">Checking for updates…</string>
+    <string name="status_up_to_date">Up to date (build %1$d)</string>
+    <string name="status_downloading_update">Downloading build %1$d…</string>
+    <string name="status_update_failed">Update failed: %1$s</string>
 
     <string name="tts_failed">Text-to-speech failed to start on this device.</string>
     <string name="mic_failed">Microphone error: %1$s</string>

@@ -5,15 +5,29 @@
     android:orientation="vertical"
     android:padding="8dp">
 
-    <TextView
-        android:id="@+id/statusText"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:gravity="center"
-        android:textSize="14sp"
-        android:textStyle="italic"
-        android:padding="6dp"
-        android:text="@string/status_starting" />
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_vertical"
+            android:textSize="14sp"
+            android:textStyle="italic"
+            android:padding="6dp"
+            android:text="@string/status_starting" />
+
+        <Button
+            android:id="@+id/btnUpdate"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_update" />
+    </LinearLayout>
 
     <ScrollView
         android:id="@+id/transcriptScroll"
@@ -40,28 +54,12 @@
         android:padding="8dp"
         android:minHeight="40dp" />
 
-    <LinearLayout
+    <Button
+        android:id="@+id/btnConversation"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/btnEnglish"
-            android:layout_width="0dp"
-            android:layout_height="110dp"
-            android:layout_weight="1"
-            android:layout_margin="6dp"
-            android:textSize="18sp"
-            android:text="@string/btn_english" />
-
-        <Button
-            android:id="@+id/btnPortuguese"
-            android:layout_width="0dp"
-            android:layout_height="110dp"
-            android:layout_weight="1"
-            android:layout_margin="6dp"
-            android:textSize="18sp"
-            android:text="@string/btn_portuguese" />
-    </LinearLayout>
+        android:layout_height="100dp"
+        android:layout_margin="6dp"
+        android:textSize="20sp"
+        android:text="@string/btn_start_conversation" />
 
 </LinearLayout>
