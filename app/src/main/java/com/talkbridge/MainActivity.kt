@@ -34,9 +34,6 @@ import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
-import com.k2fsa.sherpa.onnx.SpokenLanguageIdentification
-import com.k2fsa.sherpa.onnx.SpokenLanguageIdentificationConfig
-import com.k2fsa.sherpa.onnx.SpokenLanguageIdentificationWhisperConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
 import org.json.JSONObject
@@ -50,14 +47,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * TalkBridge v3 engine: OpenAI Whisper (small, int8) running on-device via
- * sherpa-onnx, segmented by the Silero neural voice-activity detector.
+ * TalkBridge v4: manual language lock.
  *
- * Compared to the old dual-Vosk design:
- *  - ONE decoder; Whisper detects the spoken language natively per utterance
- *  - Neural VAD instead of an energy heuristic: far fewer hallucinations
- *  - Much better accuracy, especially for Portuguese and accented speech
- *  - Trade-off: no live partial text (Whisper decodes whole utterances)
+ * The speaker's language is selected with two mode buttons rather than
+ * auto-detected. This removes the entire detection stack (spoken language
+ * ID, similarity routing, arbitration) — the source of every routing error —
+ * and roughly halves the decode work per utterance.
+ *
+ * Pipeline per utterance:
+ *   EN mode: VAD -> Whisper (EN-forced) -> ML Kit EN->PT -> speak PT
+ *   PT mode: VAD -> Whisper (PT-forced) -> ensemble translation
+ *            (Whisper translate task vs ML Kit, agreement-gated) -> speak EN
  */
 class MainActivity : AppCompatActivity() {
 
@@ -66,16 +66,14 @@ class MainActivity : AppCompatActivity() {
         const val VAD_WINDOW = 512 // samples per VAD step (32ms)
 
         // --- Tuning knobs ---
-        const val VAD_THRESHOLD = 0.60f       // Silero speech probability threshold
-        const val MIN_SILENCE_S = 0.8f        // pause that ends an utterance
-        const val MIN_SPEECH_S = 0.5f         // ignore blips shorter than this
-        const val MAX_SPEECH_S = 18f          // hard cap per utterance
+        const val VAD_THRESHOLD = 0.60f  // Silero speech probability threshold
+        const val MIN_SILENCE_S = 0.8f   // pause that ends an utterance
+        const val MIN_SPEECH_S = 0.5f    // ignore blips shorter than this
+        const val MAX_SPEECH_S = 18f     // hard cap per utterance
         const val WHISPER_THREADS = 4
-        const val MAX_WORD_RUN = 2            // collapse word repeats beyond this
-        const val EN_ACCEPT_RATIO = 1.3       // how clearly English must win arbitration
-        const val MIN_TRANSLATE_S = 2.0f      // clips shorter than this use ML Kit instead of whisper-translate
-        const val EN_SIMILARITY = 0.5         // transcript-vs-translation overlap that proves English audio
-        const val TRANSLATE_AGREE = 0.6       // whisper/ML Kit agreement needed to prefer whisper's wording
+        const val MAX_WORD_RUN = 2       // collapse word repeats beyond this
+        const val MIN_TRANSLATE_S = 2.0f // clips shorter than this skip whisper-translate
+        const val TRANSLATE_AGREE = 0.6  // whisper/ML Kit agreement to prefer whisper wording
         const val GITHUB_REPO = "davidhewitt2021-lgtm/talkbridge"
     }
 
@@ -85,22 +83,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var transcriptScroll: ScrollView
     private lateinit var btnConversation: Button
     private lateinit var btnUpdate: Button
-    private lateinit var flagView: TextView
+    private lateinit var btnModeEn: Button
+    private lateinit var btnModePt: Button
     private lateinit var activityView: TextView
     private lateinit var meter: LevelMeterView
 
     private val colorEn = 0xFF1E5AA8.toInt() // blue
     private val colorPt = 0xFFDA291C.toInt() // red
-    private val colorIdle = 0xFF888888.toInt()
-    private var shownFlag = ""
     private var shownActivity = ""
 
-    // Two language-forced decoders (forced decode beats auto-detect decode)
-    // plus a fast dedicated language-identification pass (Whisper tiny)
+    /** The locked speaker language: "en" or "pt". Set by the mode buttons. */
+    @Volatile
+    private var mode = "en"
+
     private var recognizerEn: OfflineRecognizer? = null
     private var recognizerPt: OfflineRecognizer? = null
-    private var recognizerPtTranslate: OfflineRecognizer? = null // whisper translate task: PT audio -> EN text
-    private var slid: SpokenLanguageIdentification? = null
+    private var recognizerPtTranslate: OfflineRecognizer? = null
     private var vad: Vad? = null
     private val decodeExecutor = Executors.newSingleThreadExecutor()
     private val decodesInFlight = AtomicInteger(0)
@@ -116,15 +114,6 @@ class MainActivity : AppCompatActivity() {
     private val running = AtomicBoolean(false)
     private val ttsSpeaking = AtomicBoolean(false)
     private var audioThread: Thread? = null
-
-    private var lastCommittedLang = "en" // fallback for ambiguous detections
-
-    // Last utterance kept for the tap-flag-to-flip correction
-    private var lastSamples: FloatArray? = null
-    private var lastDurationS = 0f
-    private var lastEntryView: TextView? = null
-    private var lastLangFlag = "\uD83C\uDF99" // last language flag, restored after TTS
-    private var lastLangColor = 0xFF888888.toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -146,14 +135,17 @@ class MainActivity : AppCompatActivity() {
         transcriptScroll = findViewById(R.id.transcriptScroll)
         btnConversation = findViewById(R.id.btnConversation)
         btnUpdate = findViewById(R.id.btnUpdate)
-        flagView = findViewById(R.id.flagView)
+        btnModeEn = findViewById(R.id.btnModeEn)
+        btnModePt = findViewById(R.id.btnModePt)
         activityView = findViewById(R.id.activityView)
         meter = findViewById(R.id.meter)
 
         btnConversation.isEnabled = false
         btnConversation.setOnClickListener { toggleConversation() }
         btnUpdate.setOnClickListener { checkForUpdate() }
-        flagView.setOnClickListener { redoLastAsOtherLanguage() }
+        btnModeEn.setOnClickListener { setMode("en") }
+        btnModePt.setOnClickListener { setMode("pt") }
+        setMode("en")
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -164,6 +156,15 @@ class MainActivity : AppCompatActivity() {
         initTts()
         initTranslators()
         initSpeechEngine()
+    }
+
+    /** Lock the speaker language and reflect it in the UI. */
+    private fun setMode(lang: String) {
+        mode = lang
+        val enSelected = lang == "en"
+        btnModeEn.alpha = if (enSelected) 1.0f else 0.45f
+        btnModePt.alpha = if (enSelected) 0.45f else 1.0f
+        meter.setAccent(if (enSelected) colorEn else colorPt)
     }
 
     // ---------- Crash reporting ----------
@@ -222,7 +223,7 @@ class MainActivity : AppCompatActivity() {
             .addOnFailureListener { setStatus(getString(R.string.status_translation_failed)) }
     }
 
-    /** Load Whisper + SLID + Silero VAD straight from APK assets. */
+    /** Load Whisper decoders + Silero VAD straight from APK assets. */
     private fun initSpeechEngine() {
         setStatus(getString(R.string.status_loading_speech))
         Thread {
@@ -235,7 +236,7 @@ class MainActivity : AppCompatActivity() {
                             whisper = OfflineWhisperModelConfig(
                                 encoder = "whisper/small-encoder.int8.onnx",
                                 decoder = "whisper/small-decoder.int8.onnx",
-                                language = language, // forced: no in-decode detection
+                                language = language,
                                 task = whisperTask,
                             ),
                             tokens = "whisper/small-tokens.txt",
@@ -247,18 +248,6 @@ class MainActivity : AppCompatActivity() {
                 recognizerEn = makeRecognizer("en", "transcribe")
                 recognizerPt = makeRecognizer("pt", "transcribe")
                 recognizerPtTranslate = makeRecognizer("pt", "translate")
-
-                // Dedicated language ID: a fast Whisper-tiny pass per segment
-                slid = SpokenLanguageIdentification(
-                    assets,
-                    SpokenLanguageIdentificationConfig(
-                        whisper = SpokenLanguageIdentificationWhisperConfig(
-                            encoder = "lid/tiny-encoder.int8.onnx",
-                            decoder = "lid/tiny-decoder.int8.onnx",
-                        ),
-                        numThreads = 2,
-                    )
-                )
 
                 val vadConfig = VadModelConfig(
                     sileroVadModelConfig = SileroVadModelConfig(
@@ -345,7 +334,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (read < VAD_WINDOW) continue
 
-                // Level meter (RMS of this 32ms window)
                 var sum = 0.0
                 for (i in 0 until VAD_WINDOW) {
                     val s = shortBuf[i].toDouble()
@@ -358,35 +346,36 @@ class MainActivity : AppCompatActivity() {
                 if (ttsSpeaking.get()) {
                     wasSpeaking = true
                     meter.push(0f)
-                    showFlag("\uD83D\uDD0A", colorIdle) // 🔊
+                    showActivity("\uD83D\uDD0A") // 🔊
                     continue
                 }
                 if (wasSpeaking) {
                     vad.flush()
-                    while (!vad.empty()) vad.pop() // discard anything captured pre-TTS
+                    while (!vad.empty()) vad.pop()
                     wasSpeaking = false
                     showActivity("\uD83C\uDF99") // 🎙
                 }
                 meter.push(level)
 
-                // Neural VAD: Silero decides what is speech
                 vad.acceptWaveform(floatBuf)
 
                 if (vad.isSpeechDetected()) {
-                    showFlag("\uD83D\uDC42", colorIdle) // 👂 hearing speech
+                    showActivity("\uD83D\uDC42") // 👂
+                } else if (decodesInFlight.get() == 0) {
+                    showActivity("\uD83C\uDF99") // 🎙
                 }
-                // NOTE: no idle repaint — the last language flag persists
-                // between utterances so people can actually see it
 
-                // Completed speech segments -> Whisper (off this thread)
                 while (!vad.empty()) {
                     val samples = vad.front().samples
                     vad.pop()
+                    // Capture the mode at utterance time, so switching modes
+                    // mid-decode cannot cross-wire a pending segment
+                    val utteranceLang = mode
                     decodesInFlight.incrementAndGet()
                     runOnUiThread {
                         partialText.text = getString(R.string.status_transcribing)
                     }
-                    decodeExecutor.execute { decodeSegment(samples) }
+                    decodeExecutor.execute { decodeSegment(samples, utteranceLang) }
                 }
             }
             vad.flush()
@@ -399,80 +388,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Runs on the decode executor. The language decision is made by the
-     * transcript-vs-translation similarity test in BOTH directions (spoken
-     * language ID proved biased both ways). The tiny LID model is only
-     * consulted for short clips where the translate task is unreliable.
-     */
-    private fun decodeSegment(samples: FloatArray) {
+    /** Runs on the decode executor: one forced decode in the locked language. */
+    private fun decodeSegment(samples: FloatArray, lang: String) {
         try {
             val durationS = samples.size.toFloat() / SAMPLE_RATE
-            lastSamples = samples
-            lastDurationS = durationS
-
-            if (durationS >= MIN_TRANSLATE_S) {
-                // Audio-level translation (always English out) + forced-EN transcript
-                val translated = sanitizeTranscript(
-                    decodeWith(recognizerPtTranslate, samples), durationS
-                )
-                val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
-
-                when {
-                    enText == null && translated == null -> return
-                    enText != null && translated != null &&
-                        maxOf(
-                            wordSimilarity(enText, translated),
-                            wordContainment(enText, translated),
-                            wordContainment(translated, enText)
-                        ) >= EN_SIMILARITY -> {
-                        // Transcript matches the translation: the audio WAS English
-                        commitEnglish(enText)
-                    }
-                    enText != null && translated == null -> {
-                        // Translation failed but a clean English transcript exists
-                        commitEnglish(enText)
-                    }
-                    else -> {
-                        // Divergent (or no EN transcript): the audio was Portuguese
-                        val ptText = sanitizeTranscript(
-                            decodeWith(recognizerPt, samples), durationS
-                        ) ?: return
-                        commitLang("pt")
-                        commitPortuguese(samples, ptText, durationS, translated)
-                    }
-                }
-                return
-            }
-
-            // ---- Short clip: translate task unreliable, ask the LID model ----
-            val lid = slid ?: return
-            val lidStream = lid.createStream()
-            lidStream.acceptWaveform(samples, SAMPLE_RATE)
-            val detected = lid.compute(lidStream).lowercase().filter { it.isLetter() }
-            lidStream.release()
-
-            if (detected == "en") {
-                val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
-                val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                when {
-                    enText == null && ptText == null -> return
-                    ptText == null -> commitEnglish(enText!!)
-                    enText == null -> { commitLang("pt"); translateAndSpeak(ptText, "pt") }
-                    else -> {
-                        val bar = if (lastCommittedLang == "en") 1.0 else EN_ACCEPT_RATIO
-                        if (enText.split(" ").size >= ptText.split(" ").size * bar) {
-                            commitEnglish(enText)
-                        } else {
-                            commitLang("pt"); translateAndSpeak(ptText, "pt")
-                        }
-                    }
-                }
-            } else {
-                val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+            if (lang == "en") {
+                val text = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
                     ?: return
-                commitLang("pt")
-                translateAndSpeak(ptText, "pt") // short PT -> ML Kit
+                translateEnglish(text)
+            } else {
+                val text = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
+                    ?: return
+                translatePortuguese(samples, text, durationS)
             }
         } catch (e: Exception) {
             runOnUiThread { toast(getString(R.string.mic_failed, e.message)) }
@@ -481,18 +408,6 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { partialText.text = "" }
             }
         }
-    }
-
-    private fun commitLang(lang: String) {
-        lastCommittedLang = lang
-        if (lang == "pt") { lastLangFlag = "\uD83C\uDDF5\uD83C\uDDF9"; lastLangColor = colorPt }
-        else { lastLangFlag = "\uD83C\uDDEC\uD83C\uDDE7"; lastLangColor = colorEn }
-        showFlag(lastLangFlag, lastLangColor)
-    }
-
-    private fun commitEnglish(text: String) {
-        commitLang("en")
-        translateAndSpeak(text, "en")
     }
 
     /** One forced decode of a segment; returns the raw transcript. */
@@ -507,23 +422,71 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * PT -> EN goes through Whisper's native translate task: English is
-     * produced directly from the AUDIO (better than ML Kit, and immune to
-     * transcription-error compounding). Falls back to ML Kit if the
-     * translate decode comes back empty.
+     * Cleans Whisper repetition-loop artifacts and event tags, and rejects
+     * transcripts that were mostly hallucinated. Returns text or null.
      */
+    private fun sanitizeTranscript(raw: String, durationS: Float): String? {
+        fun norm(w: String) = w.lowercase().trim('.', ',', '!', '?', ';', ':', '…', '-')
+
+        // Strip whisper event tags emitted on music/noise, including
+        // unclosed ones: [Música], (music), "(laughs", ♪
+        val cleaned = raw.replace(Regex("\\[[^\\]]*\\]?|\\([^)]*\\)?|♪"), " ")
+        val words = cleaned.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (words.isEmpty()) return null
+        val junk = setOf("laughs", "laughter", "music", "applause", "sighs",
+                         "risos", "música", "musica", "aplausos")
+        if (words.all { it.lowercase().trim('.', ',', '!') in junk }) return null
+
+        val collapsed = ArrayList<String>(words.size)
+        var runWord = ""
+        var runLen = 0
+        for (w in words) {
+            if (norm(w) == runWord) {
+                runLen++
+                if (runLen <= MAX_WORD_RUN) collapsed.add(w)
+            } else {
+                runWord = norm(w)
+                runLen = 1
+                collapsed.add(w)
+            }
+        }
+
+        var result: List<String> = collapsed
+        while (result.size >= 4 && result.size % 2 == 0) {
+            val half = result.size / 2
+            val looped = (0 until half).all { norm(result[it]) == norm(result[it + half]) }
+            if (!looped) break
+            result = result.subList(0, half)
+        }
+
+        val loopRatio = words.size.toDouble() / result.size
+        if (loopRatio > 3.0 && result.size <= 3) return null
+        if (durationS > 4f && result.size <= 1) return null
+
+        return result.joinToString(" ")
+    }
+
+    // ---------- Translation ----------
+
+    /** EN -> PT via ML Kit; speak Portuguese. */
+    private fun translateEnglish(text: String) {
+        enToPt.translate(text)
+            .addOnSuccessListener { translated ->
+                addTranscriptEntry("en", text, translated)
+                speak(translated, "pt")
+            }
+            .addOnFailureListener { e -> toast(getString(R.string.translate_failed, e.message)) }
+    }
+
     /**
      * PT -> EN translation ensemble. ML Kit is faithful to the transcript;
      * whisper-translate is more fluent but prone to phonetic passthrough
      * ("cerveja" -> "survey"). Whisper's wording is used only when the two
      * independent translations agree; on divergence, faithfulness wins.
      */
-    private fun commitPortuguese(
-        samples: FloatArray, ptTranscript: String, durationS: Float,
-        precomputedEnglish: String? = null
-    ) {
-        val whisperEnglish = precomputedEnglish
-            ?: if (durationS >= MIN_TRANSLATE_S)
+    private fun translatePortuguese(samples: FloatArray, ptTranscript: String, durationS: Float) {
+        val whisperEnglish =
+            if (durationS >= MIN_TRANSLATE_S)
                 sanitizeTranscript(decodeWith(recognizerPtTranslate, samples), durationS)
             else null
 
@@ -544,55 +507,7 @@ class MainActivity : AppCompatActivity() {
             }
     }
 
-    /** Fraction of a's words found in b (paraphrase/length tolerant), 0..1. */
-    private fun wordContainment(a: String, b: String): Double {
-        fun tokens(t: String) = t.lowercase()
-            .replace(Regex("[^a-z0-9à-ÿ ]"), " ")
-            .split(Regex("\\s+")).filter { it.isNotBlank() }
-        val ta = tokens(a)
-        if (ta.isEmpty()) return 0.0
-        val tb = tokens(b).toSet()
-        return ta.count { it in tb }.toDouble() / ta.size
-    }
-
-    /**
-     * Tap-the-flag correction: re-run the last utterance forced to the OTHER
-     * language, replacing the transcript entry and the spoken output. This is
-     * the guaranteed escape hatch for auto-detection's irreducible error tail.
-     */
-    private fun redoLastAsOtherLanguage() {
-        val samples = lastSamples ?: return
-        val durationS = lastDurationS
-        val flipTo = if (lastCommittedLang == "en") "pt" else "en"
-        tts?.stop()
-        ttsSpeaking.set(false)
-        lastEntryView?.let { entry -> runOnUiThread { transcript.removeView(entry) } }
-        lastEntryView = null
-        decodesInFlight.incrementAndGet()
-        runOnUiThread { partialText.text = getString(R.string.status_transcribing) }
-        decodeExecutor.execute {
-            try {
-                if (flipTo == "pt") {
-                    val ptText = sanitizeTranscript(decodeWith(recognizerPt, samples), durationS)
-                        ?: return@execute
-                    commitLang("pt")
-                    commitPortuguese(samples, ptText, durationS)
-                } else {
-                    val enText = sanitizeTranscript(decodeWith(recognizerEn, samples), durationS)
-                        ?: return@execute
-                    commitEnglish(enText)
-                }
-            } catch (e: Exception) {
-                runOnUiThread { toast(getString(R.string.mic_failed, e.message)) }
-            } finally {
-                if (decodesInFlight.decrementAndGet() == 0) {
-                    runOnUiThread { partialText.text = "" }
-                }
-            }
-        }
-    }
-
-    /** Word-set overlap (Jaccard) between two texts, 0..1. */
+    /** Word-set overlap (Jaccard) between two texts, 0..1. Ensemble use only. */
     private fun wordSimilarity(a: String, b: String): Double {
         fun tokens(t: String) = t.lowercase()
             .replace(Regex("[^a-z0-9à-ÿ ]"), " ")
@@ -600,76 +515,6 @@ class MainActivity : AppCompatActivity() {
         val ta = tokens(a); val tb = tokens(b)
         if (ta.isEmpty() || tb.isEmpty()) return 0.0
         return ta.intersect(tb).size.toDouble() / ta.union(tb).size
-    }
-
-    /**
-     * Whisper's known failure mode on noisy or clipped audio is the
-     * repetition loop ("no no no no…"). This cleans transcripts up and
-     * rejects ones that were mostly hallucinated:
-     *  1. Collapse runs of the same word beyond MAX_WORD_RUN
-     *  2. Collapse whole-phrase loops (text that is a repeated block)
-     *  3. Reject if the transcript was dominated by looping
-     *  4. Reject if lots of audio produced almost no words (decode failure)
-     * Returns the cleaned text, or null if the segment should be discarded.
-     */
-    private fun sanitizeTranscript(raw: String, durationS: Float): String? {
-        fun norm(w: String) = w.lowercase().trim('.', ',', '!', '?', ';', ':', '…', '-')
-
-        // Strip whisper event tags emitted on music/noise, including
-        // unclosed ones: [Música], (music), "(laughs", ♪
-        val cleaned = raw.replace(Regex("\\[[^\\]]*\\]?|\\([^)]*\\)?|♪"), " ")
-        val words = cleaned.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (words.isEmpty()) return null
-        val junk = setOf("laughs", "laughter", "music", "applause", "sighs",
-                         "risos", "música", "musica", "aplausos")
-        if (words.all { it.lowercase().trim('.', ',', '!') in junk }) return null
-
-        // 1. Collapse word runs: "no no no no no" -> "no no"
-        val collapsed = ArrayList<String>(words.size)
-        var runWord = ""
-        var runLen = 0
-        for (w in words) {
-            if (norm(w) == runWord) {
-                runLen++
-                if (runLen <= MAX_WORD_RUN) collapsed.add(w)
-            } else {
-                runWord = norm(w)
-                runLen = 1
-                collapsed.add(w)
-            }
-        }
-
-        // 2. Collapse phrase loops: "how are you how are you" -> "how are you"
-        var result: List<String> = collapsed
-        while (result.size >= 4 && result.size % 2 == 0) {
-            val half = result.size / 2
-            val looped = (0 until half).all { norm(result[it]) == norm(result[it + half]) }
-            if (!looped) break
-            result = result.subList(0, half)
-        }
-
-        // 3. If most of the segment was looping and little survived, it was
-        //    a hallucination artifact, not speech
-        val loopRatio = words.size.toDouble() / result.size
-        if (loopRatio > 3.0 && result.size <= 3) return null
-
-        // 4. Several seconds of audio decoding to a word or two means the
-        //    decode failed — better to say nothing than something wrong
-        if (durationS > 4f && result.size <= 1) return null
-
-        return result.joinToString(" ")
-    }
-
-    // ---------- Translate + speak ----------
-
-    private fun translateAndSpeak(text: String, sourceLang: String) {
-        val translator = if (sourceLang == "en") enToPt else ptToEn
-        translator.translate(text)
-            .addOnSuccessListener { translated ->
-                addTranscriptEntry(sourceLang, text, translated)
-                speak(translated, if (sourceLang == "en") "pt" else "en")
-            }
-            .addOnFailureListener { e -> toast(getString(R.string.translate_failed, e.message)) }
     }
 
     private fun speak(text: String, lang: String) {
@@ -749,18 +594,9 @@ class MainActivity : AppCompatActivity() {
         entry.setTypeface(Typeface.DEFAULT)
         entry.gravity = if (sourceLang == "en") Gravity.START else Gravity.END
         transcript.addView(entry)
-        lastEntryView = entry
         transcriptScroll.post { transcriptScroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
-    private fun showFlag(flag: String, accent: Int) {
-        if (flag == shownFlag) return
-        shownFlag = flag
-        meter.setAccent(accent)
-        runOnUiThread { flagView.text = flag }
-    }
-
-    /** The activity icon (mic/ear/speaker) — separate from the language flag. */
     private fun showActivity(icon: String) {
         if (icon == shownActivity) return
         shownActivity = icon
@@ -785,7 +621,6 @@ class MainActivity : AppCompatActivity() {
         recognizerEn?.release()
         recognizerPt?.release()
         recognizerPtTranslate?.release()
-        slid?.release()
         vad?.release()
     }
 }

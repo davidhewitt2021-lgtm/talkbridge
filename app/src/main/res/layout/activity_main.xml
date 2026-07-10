@@ -43,34 +43,18 @@
             android:orientation="vertical" />
     </ScrollView>
 
-    <!-- Live panel: activity icon (mic/ear/speaker) + detected language flag,
-         shown side by side so the flag is always visible -->
-    <LinearLayout
+    <TextView
+        android:id="@+id/activityView"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center">
-
-        <TextView
-            android:id="@+id/activityView"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textSize="56sp"
-            android:text="🎙" />
-
-        <TextView
-            android:id="@+id/flagView"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="32dp"
-            android:textSize="56sp"
-            android:text="" />
-    </LinearLayout>
+        android:gravity="center"
+        android:textSize="48sp"
+        android:text="🎙" />
 
     <com.talkbridge.LevelMeterView
         android:id="@+id/meter"
         android:layout_width="match_parent"
-        android:layout_height="56dp"
+        android:layout_height="52dp"
         android:layout_marginStart="12dp"
         android:layout_marginEnd="12dp"
         android:layout_marginBottom="4dp" />
@@ -86,10 +70,35 @@
         android:padding="4dp"
         android:minHeight="32dp" />
 
+    <!-- Language lock: the speaker selects their language -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnModeEn"
+            android:layout_width="0dp"
+            android:layout_height="64dp"
+            android:layout_weight="1"
+            android:layout_margin="4dp"
+            android:textSize="16sp"
+            android:text="@string/btn_mode_en" />
+
+        <Button
+            android:id="@+id/btnModePt"
+            android:layout_width="0dp"
+            android:layout_height="64dp"
+            android:layout_weight="1"
+            android:layout_margin="4dp"
+            android:textSize="16sp"
+            android:text="@string/btn_mode_pt" />
+    </LinearLayout>
+
     <Button
         android:id="@+id/btnConversation"
         android:layout_width="match_parent"
-        android:layout_height="100dp"
+        android:layout_height="90dp"
         android:layout_margin="6dp"
         android:textSize="20sp"
         android:text="@string/btn_start_conversation" />

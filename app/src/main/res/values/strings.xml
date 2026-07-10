@@ -4,14 +4,16 @@
     <string name="btn_start_conversation">🎙 Start conversation / Iniciar conversa</string>
     <string name="btn_stop_conversation">■ Stop / Parar</string>
     <string name="btn_update">Update</string>
+    <string name="btn_mode_en">🇬🇧 I speak English</string>
+    <string name="btn_mode_pt">🇵🇹 Eu falo Português</string>
 
     <string name="status_starting">Starting… / A iniciar…</string>
     <string name="status_downloading_translation">Downloading translation packs (first run only)…</string>
     <string name="status_translation_failed">Translation pack download failed — connect to the internet once and restart the app.</string>
     <string name="status_loading_speech">Loading Whisper model… / A carregar…</string>
     <string name="status_speech_failed">Speech model failed to load: %1$s</string>
-    <string name="status_ready">Ready — just talk, in either language / Pronto — fale, em qualquer língua</string>
-    <string name="status_conversing">Listening… speak naturally / A ouvir… fale naturalmente</string>
+    <string name="status_ready">Ready — select your language, then talk / Pronto — escolha a língua e fale</string>
+    <string name="status_conversing">Listening… / A ouvir…</string>
     <string name="status_transcribing">✍ transcribing…</string>
 
     <string name="status_checking_update">Checking for updates…</string>

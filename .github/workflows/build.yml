@@ -22,21 +22,16 @@ jobs:
 
       - name: Download Whisper models and Silero VAD
         run: |
-          mkdir -p app/src/main/assets/whisper app/src/main/assets/lid app/src/main/assets/vad
+          mkdir -p app/src/main/assets/whisper app/src/main/assets/vad
           curl -sL -o whisper.tar.bz2 \
             https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2
           tar xf whisper.tar.bz2
           cp sherpa-onnx-whisper-small/small-encoder.int8.onnx app/src/main/assets/whisper/
           cp sherpa-onnx-whisper-small/small-decoder.int8.onnx app/src/main/assets/whisper/
           cp sherpa-onnx-whisper-small/small-tokens.txt        app/src/main/assets/whisper/
-          curl -sL -o tiny.tar.bz2 \
-            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2
-          tar xf tiny.tar.bz2
-          cp sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx app/src/main/assets/lid/
-          cp sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx app/src/main/assets/lid/
           curl -sL -o app/src/main/assets/vad/silero_vad.onnx \
             https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-          ls -lh app/src/main/assets/whisper app/src/main/assets/lid app/src/main/assets/vad
+          ls -lh app/src/main/assets/whisper app/src/main/assets/vad
 
       - name: Restore signing key
         run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > $HOME/talkbridge.keystore
