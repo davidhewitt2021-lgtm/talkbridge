@@ -1,90 +1,107 @@
 # TalkBridge 🇬🇧↔🇵🇹
 
-An offline English ↔ Portuguese voice translator for Android. Tap a button, speak, and the phone speaks the translation aloud. After first-run setup, **no internet and no AI tokens are ever needed**.
+An offline English ↔ European Portuguese voice translator for Android. Select
+your language, speak, and the phone speaks the translation aloud, showing both
+texts as a conversation history. After first-run setup, **no internet, no
+accounts, and no AI tokens are ever needed**.
 
-- Speech recognition: [Vosk](https://alphacephei.com/vosk/) (on-device, models bundled into the APK by the build)
-- Translation: Google ML Kit on-device translation (model packs download once on first launch, then work offline forever)
-- Voice output: Android's built-in text-to-speech
+Built and maintained entirely from an Android phone using Termux, with all
+compilation done by GitHub Actions.
 
----
+## How it works
 
-## Building it — entirely from a phone
-
-You never compile anything yourself. GitHub's servers build the APK for you.
-
-### 1. One-time setup
-
-1. Create a free account at https://github.com if you don't have one.
-2. Install **Termux** from **F-Droid** (https://f-droid.org — the Play Store version is outdated). 
-3. In Termux:
-   ```bash
-   pkg update
-   pkg install git gh unzip
-   termux-setup-storage    # grants access to your Downloads folder
-   ```
-
-### 2. Get this project into a GitHub repo
-
-Assuming you downloaded `TalkBridge.zip` to your phone's Downloads:
-
-```bash
-cd ~
-cp ~/storage/downloads/TalkBridge.zip .
-unzip TalkBridge.zip
-cd TalkBridge
-
-gh auth login        # choose GitHub.com → HTTPS → login via browser, enter the code shown
-
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-gh repo create talkbridge --private --source=. --push
+```
+mic ──▶ Silero VAD ──▶ Whisper-small (forced to the selected language)
+              │                      │
+              │            EN mode: ML Kit EN→PT
+              │            PT mode: translation ensemble —
+              │              Whisper translate-task (audio→EN) vs ML Kit (text),
+              │              agreement-gated: fluent when they agree,
+              │              faithful when they diverge
+              ▼                      │
+        level meter            Android TTS speaks the translation
 ```
 
-### 3. Download the APK
+**Speech recognition:** OpenAI Whisper `small` (int8) running on-device via
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Two forced-language
+transcribe instances plus one translate-task instance.
 
-1. In your phone browser, go to your repo: `https://github.com/YOURNAME/talkbridge`
-2. Tap the **Actions** tab. A "Build APK" run starts automatically after the push. Wait ~5 minutes for the green tick.
-3. Open the completed run, scroll to **Artifacts**, download **TalkBridge-apk**.
-4. Unzip it (your Files app can, or `unzip` in Termux) to get `app-debug.apk`.
-5. Tap the APK to install. Android will ask you to allow installs from your browser/Files app — allow it.
+**Voice activity detection:** Silero neural VAD segments speech into
+utterances; silence never reaches the decoder (Whisper hallucinates on
+silence). Segments end after 0.8s of quiet.
 
-### 4. First launch (needs internet once)
+**Language selection:** manual lock via two mode buttons. Earlier versions
+auto-detected the language (spoken-language ID, dual-decode arbitration,
+transcript-vs-translation similarity). All were retired: language ID on short
+utterances has an irreducible error tail, and Whisper covertly *translates*
+wrong-language audio rather than garbling it, defeating quality heuristics.
+Manual lock is deterministic, and halves the decode work.
 
-- Grant microphone permission when asked.
-- The app downloads the ML Kit English↔Portuguese translation packs (~60 MB total) on first launch. Wait for the status line to say **Ready**.
-- After that, the app is fully offline. Test it in airplane mode.
+**Translation:** EN→PT via ML Kit on-device translation. PT→EN via an
+ensemble — Whisper's native translate task (better fluency, works from the
+audio) cross-checked against ML Kit on the transcript; Whisper's wording is
+used only when the two independently agree, which filters Whisper's phonetic
+passthrough failures ("cerveja" → "survey").
 
-### 5. Portuguese voice (recommended)
+**Hygiene:** a transcript sanitizer collapses Whisper repetition loops,
+strips event tags (`[Música]`, `(laughs`), and rejects hallucinated segments.
+Echo suppression mutes the mic while the phone itself is speaking.
 
-For spoken Portuguese output, make sure an offline Portuguese TTS voice is installed:
-**Settings → General management (or System) → Text-to-speech → Google Speech Services → Install voice data → Português (Portugal)**.
-Menu names vary slightly by manufacturer.
+## Installing
 
----
+Grab `TalkBridge.apk` from the newest entry on the
+[Releases page](../../releases), allow installs from your browser/files app,
+and install. First launch needs internet once (~60MB of ML Kit translation
+packs); after that it is fully offline — works in airplane mode.
+
+Recommended: install the offline **Português (Portugal)** voice under
+Settings → Text-to-speech → Install voice data, so spoken output is pt-PT.
 
 ## Using it
 
-- 🇬🇧 person taps **I speak English**, talks, taps **Stop**. The phone shows and speaks the Portuguese.
-- 🇵🇹 person taps **Eu falo Português**, fala, toca em **Parar**. O telemóvel mostra e diz a versão em inglês.
-- The conversation history stays on screen so anyone can re-read it.
+1. Tap **Start conversation**
+2. Tap the language of whoever is about to speak
+   (🇬🇧 *I speak English* / 🇵🇹 *Eu falo Português*)
+3. Talk naturally in full phrases — context-rich sentences transcribe far
+   better than single words ("eu quero uma maçã" beats "maçã")
+4. The 👂 icon shows it hearing you; ✍ shows transcription; 🔊 while it speaks
+5. Tap the other language button when the other person replies
 
-## Making changes
+**Update button** (top right): checks GitHub Releases, downloads, and installs
+the newest build over the top — every push to `main` publishes one.
 
-Edit the code (in Termux with `nano`/`vim`, or any editor app), then:
+## Development
+
+The app is developed from a phone. Typical loop:
 
 ```bash
-git add .
-git commit -m "describe change"
-git push
+# in Termux, after downloading a changed file from the AI pair-programmer:
+bash ~/deploy.sh <content-marker> "commit message"
+# → verifies the file by content, copies it into place, pushes,
+#   GitHub Actions builds & releases, then: Update button in the app
 ```
 
-Every push triggers a fresh APK build in the Actions tab.
+- CI: `.github/workflows/build.yml` downloads the sherpa-onnx AAR and all
+  model files at build time (repo stays small), builds a signed release APK
+  (persistent keystore via repo secrets), uploads it as an artifact, and
+  publishes a Release on pushes to `main`.
+- Crash reporting: any crash writes a stack trace; the next launch displays
+  it and copies it to the clipboard for pasting into a debugging chat.
+- Tuning knobs live as constants at the top of `MainActivity.kt`
+  (VAD thresholds, sentence-gap length, ensemble agreement level).
 
-## Notes & known limits
+## Hardware notes
 
-- Vosk "small" models are used to keep the APK reasonable (~120 MB). Recognition is good for clear conversational speech; heavy accents or noisy rooms will degrade it.
-- The Portuguese Vosk model is trained mostly on European + Brazilian Portuguese mixed; it handles pt-PT well.
-- ML Kit translation is solid for everyday conversation, weaker on idioms — keep sentences simple for best results.
-- This is a debug-signed APK for personal use. It can't go on the Play Store as-is (that would need a signing key, easily added later).
+Runs comfortably on 8GB-RAM midrange devices (developed on a CMF Phone 1,
+Dimensity 7300). APK is ~300MB (Whisper-small weights baked in); model load
+takes ~20s at app start; decode is roughly 2–5s per utterance depending on
+SoC. Accuracy improves markedly when the phone is within arm's reach of the
+speaker.
+
+## Limits (honest ones)
+
+- Near-homophones without context (maçã/massa) can transcribe wrongly —
+  speak in phrases, not single words
+- ML Kit translation is literal on idioms
+- One utterance at a time; overlapping speakers confuse the VAD
+- This is a personally-signed APK for private use, not a Play Store app
